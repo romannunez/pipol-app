@@ -1,0 +1,716 @@
+import React, { useState, useEffect, useRef } from "react";
+import { useToast } from "@/hooks/use-toast";
+import { apiRequest } from "@/lib/queryClient";
+import { useLocation } from "wouter";
+import { CalendarIcon, MapPin, Users, X, MessageSquare, Share2, UserPlus, Edit, Trash2 } from "lucide-react";
+import { useAuth } from "@/hooks/use-auth";
+import { Avatar } from "@/components/ui/avatar";
+import { Button } from "@/components/ui/button";
+import { format } from "date-fns";
+import { es } from "date-fns/locale";
+import Chat from "@/components/chat/chat";
+import EventRequests from "@/components/events/event-requests";
+import EditEventForm from "@/components/events/edit-event-form";
+import { formatPrice } from "@/lib/stripe";
+import mapboxgl from 'mapbox-gl';
+
+type EventDetailSheetProps = {
+  event: {
+    id: number;
+    title: string;
+    description: string;
+    category: string;
+    date: string;
+    locationName: string;
+    locationAddress: string;
+    paymentType: string;
+    price?: string | number;
+    maxCapacity?: number;
+    privacyType: string;
+    longitude?: number | string;
+    latitude?: number | string;
+    photoUrl?: string;
+    photo_url?: string;
+    videoUrl?: string;
+    video_url?: string;
+    // Campos multimedia nuevos
+    mediaItems?: string;          // JSON string de items multimedia
+    mainMediaType?: string;       // Tipo del medio principal ('photo' o 'video')
+    mainMediaUrl?: string;        // URL del medio principal
+    organizerId: number;         // ID del organizador
+    organizer: {
+      id: number;
+      name: string;
+      avatar?: string;
+    };
+    attendees: Array<{
+      id: number;
+      user: {
+        id: number;
+        name: string;
+        avatar?: string;
+      };
+    }>;
+  };
+  onClose: () => void;
+  visible: boolean;
+};
+
+const EventDetailSheet = ({ event, onClose, visible }: EventDetailSheetProps) => {
+  const { user } = useAuth();
+  const { toast } = useToast();
+  const [_, navigate] = useLocation();
+  const [chatVisible, setChatVisible] = useState(false);
+  const [mapLoaded, setMapLoaded] = useState(false);
+  const [showRequests, setShowRequests] = useState(false);
+  const [editFormVisible, setEditFormVisible] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<mapboxgl.Map | null>(null);
+
+  // Asegurarse de que la fecha sea válida
+  const eventDate = event.date ? new Date(event.date) : new Date();
+  
+  // Validar asistentes y estado de asistencia
+  const safeAttendees = event.attendees || [];
+  const [isAttending, setIsAttending] = useState(false);
+
+  // Verificar si el usuario está asistiendo al evento usando la API
+  useEffect(() => {
+    if (user && event.id) {
+      const checkAttendanceStatus = async () => {
+        try {
+          const res = await fetch(`/api/events/${event.id}/status`, {
+            method: 'GET',
+            credentials: 'include',
+            headers: {
+              'Content-Type': 'application/json'
+            }
+          });
+          
+          if (res.ok) {
+            // Si la API responde con éxito, el usuario está asistiendo
+            setIsAttending(true);
+            console.log("Usuario está asistiendo al evento según la API");
+          } else if (res.status === 404) {
+            // Si la API responde con 404, el usuario no está asistiendo
+            setIsAttending(false);
+            console.log("Usuario no está asistiendo al evento según la API");
+          }
+        } catch (error) {
+          console.error("Error verificando asistencia:", error);
+          setIsAttending(false);
+        }
+      };
+      
+      checkAttendanceStatus();
+    }
+  }, [user, event.id]);
+  
+  // Validar organizador
+  const isOrganizer = event.organizer?.id === user?.id;
+  
+  // Calcular capacidad y conteo
+  const spotsLeft = event.maxCapacity ? event.maxCapacity - (safeAttendees.length || 0) : null;
+  const attendeeCount = safeAttendees.length || 0;
+  
+  // Inicializar el mapa cuando el componente sea visible
+  useEffect(() => {
+    if (!visible || !mapContainerRef.current || mapLoaded) return;
+    
+    if (!import.meta.env.VITE_MAPBOX_ACCESS_TOKEN) {
+      console.error("Mapbox token is missing!");
+      return;
+    }
+
+    const mapboxToken = import.meta.env.VITE_MAPBOX_ACCESS_TOKEN;
+    mapboxgl.accessToken = mapboxToken;
+    
+    // Extraer las coordenadas desde los datos del evento y garantizar que son números
+    const location = {
+      longitude: typeof event.longitude === 'string' ? parseFloat(event.longitude) : (event.longitude || -99.1277),
+      latitude: typeof event.latitude === 'string' ? parseFloat(event.latitude) : (event.latitude || 19.4285)
+    };
+    
+    try {
+      // Asegurarse de que las coordenadas son números para Mapbox
+      const lng = typeof location.longitude === 'number' ? location.longitude : parseFloat(String(location.longitude));
+      const lat = typeof location.latitude === 'number' ? location.latitude : parseFloat(String(location.latitude));
+      
+      const map = new mapboxgl.Map({
+        container: mapContainerRef.current,
+        style: 'mapbox://styles/mapbox/streets-v11',
+        center: [lng, lat],
+        zoom: 14
+      });
+      
+      // Agregar marcador
+      new mapboxgl.Marker({ color: '#FF385C' })
+        .setLngLat([lng, lat])
+        .addTo(map);
+      
+      // Agregar controles de navegación
+      map.addControl(new mapboxgl.NavigationControl(), 'top-right');
+      
+      mapRef.current = map;
+      setMapLoaded(true);
+      
+      return () => {
+        map.remove();
+      };
+    } catch (error) {
+      console.error("Error initializing map:", error);
+    }
+  }, [visible, event]);
+  
+  const [joinRequestStatus, setJoinRequestStatus] = useState<string | null>(null);
+  
+  // Check if user has a pending request for this event
+  useEffect(() => {
+    if (user && event && !isAttending && !isOrganizer) {
+      const checkPendingRequest = async () => {
+        try {
+          const res = await apiRequest("GET", `/api/events/${event.id}/status`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.status === 'pending') {
+              setJoinRequestStatus('pending');
+            }
+          }
+        } catch (error) {
+          console.error("Error checking request status:", error);
+        }
+      };
+      
+      checkPendingRequest();
+    }
+  }, [user, event, isAttending, isOrganizer]);
+
+  const handleJoinEvent = async () => {
+    if (!user) {
+      toast({
+        title: "Autenticación Requerida",
+        description: "Por favor inicia sesión para unirte a este evento",
+        variant: "destructive",
+      });
+      navigate("/auth");
+      return;
+    }
+
+    try {
+      const res = await apiRequest("POST", `/api/events/${event.id}/join`);
+      
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.message || "Error al unirse al evento");
+      }
+      
+      const data = await res.json();
+      
+      if (data.requiresPayment) {
+        // Redirect to payment page with the client secret
+        navigate(`/payment/${event.id}?clientSecret=${data.clientSecret}`);
+        return;
+      }
+      
+      if (data.isPendingApproval) {
+        setJoinRequestStatus('pending');
+        toast({
+          title: "Solicitud Enviada",
+          description: "Tu solicitud para unirte al evento ha sido enviada y está pendiente de aprobación.",
+        });
+        return;
+      }
+      
+      toast({
+        title: "¡Éxito!",
+        description: "¡Te has unido al evento!",
+      });
+      
+      // Refresh the event details or update the UI
+      window.location.reload();
+    } catch (error) {
+      console.error("Error joining event:", error);
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "No se pudo unir al evento. Por favor intenta de nuevo.",
+        variant: "destructive",
+      });
+    }
+  };
+  
+  const handleLeaveEvent = async () => {
+    if (!user) {
+      toast({
+        title: "Autenticación Requerida",
+        description: "Por favor inicia sesión para dejar este evento",
+        variant: "destructive",
+      });
+      navigate("/login");
+      return;
+    }
+    
+    // Mostrar confirmación antes de dejar el evento
+    if (!window.confirm("¿Estás seguro que deseas dejar este evento?")) {
+      return;
+    }
+
+    try {
+      const res = await apiRequest("DELETE", `/api/events/${event.id}/leave`);
+      
+      if (res.ok) {
+        toast({
+          title: "¡Éxito!",
+          description: "Has dejado el evento exitosamente",
+        });
+        
+        // Refresh the event details or update the UI
+        window.location.reload();
+      } else {
+        const errorData = await res.json();
+        throw new Error(errorData.message || "Error al dejar el evento");
+      }
+    } catch (error) {
+      console.error("Error leaving event:", error);
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "No se pudo dejar el evento. Por favor intenta de nuevo.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  // Función para eliminar un evento
+  const handleDeleteEvent = async () => {
+    if (isDeleting) return;
+    
+    // Confirmar antes de eliminar
+    if (!window.confirm("¿Estás seguro de que deseas eliminar este evento? Esta acción no se puede deshacer.")) {
+      return;
+    }
+    
+    setIsDeleting(true);
+    
+    try {
+      const response = await apiRequest("DELETE", `/api/events/${event.id}`);
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.message || "Error al eliminar el evento");
+      }
+      
+      toast({
+        title: "Evento eliminado",
+        description: "El evento ha sido eliminado correctamente",
+      });
+      
+      // Cerrar panel de detalles
+      onClose();
+      
+      // Actualizar lista de eventos
+      setTimeout(() => {
+        import("@/lib/queryClient").then(({ queryClient }) => {
+          queryClient.invalidateQueries({ queryKey: ["/api/events"] });
+        });
+      }, 300);
+    } catch (error: any) {
+      console.error("Error eliminando evento:", error);
+      toast({
+        title: "Error al eliminar evento",
+        description: error.message || "No se pudo eliminar el evento. Por favor, inténtalo de nuevo.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  if (!visible) return null;
+
+  return (
+    <>
+      {/* Chat component */}
+      {chatVisible && (
+        <Chat 
+          eventId={event.id} 
+          eventTitle={event.title}
+          visible={chatVisible}
+          onClose={() => setChatVisible(false)}
+        />
+      )}
+      
+      {/* Formulario de edición */}
+      {editFormVisible && (
+        <EditEventForm
+          eventId={event.id}
+          event={event}
+          visible={editFormVisible}
+          onClose={() => setEditFormVisible(false)}
+        />
+      )}
+      
+      <div className="absolute bottom-0 left-0 right-0 bg-white rounded-t-3xl shadow-panel z-20 slide-up max-h-[80vh] overflow-auto">
+        <div className="p-2 flex justify-center">
+          <div className="w-10 h-1 bg-neutral-300 rounded-full"></div>
+        </div>
+        
+        <div className="p-5">
+          <div className="flex items-start justify-between mb-4">
+            <div>
+              <span className={`inline-block px-2 py-1 text-xs font-medium category-${event.category}-light rounded-full mb-2`}>
+                {event.category.charAt(0).toUpperCase() + event.category.slice(1)}
+              </span>
+              <h2 className="text-xl font-bold text-neutral-900">{event.title}</h2>
+              <p className="text-neutral-500 flex items-center gap-1 mt-1">
+                <CalendarIcon size={16} />
+                <span>{format(eventDate, "EEE, d MMM • HH:mm", { locale: es })}</span>
+              </p>
+            </div>
+            
+            <div className="flex items-center gap-2">
+              {(isAttending || isOrganizer) && (
+                <button 
+                  className="p-2 text-primary bg-primary/10 rounded-full"
+                  onClick={() => setChatVisible(true)}
+                  aria-label="Abrir chat"
+                >
+                  <MessageSquare size={20} />
+                </button>
+              )}
+              <button 
+                className="p-2 text-neutral-400 hover:text-neutral-600 transition-colors"
+                onClick={onClose}
+                aria-label="Cerrar detalles"
+              >
+                <X size={20} />
+              </button>
+            </div>
+          </div>
+          
+          {/* Medio principal del evento */}
+          <div className="aspect-video bg-neutral-200 rounded-xl mb-5 overflow-hidden">
+            {/* Determinar qué medio mostrar como principal */}
+            {event.mainMediaUrl ? (
+              event.mainMediaType === 'video' ? (
+                <video 
+                  src={event.mainMediaUrl}
+                  className="w-full h-full object-cover"
+                  controls
+                  preload="metadata"
+                />
+              ) : (
+                <img 
+                  src={event.mainMediaUrl}
+                  className="w-full h-full object-cover"
+                  alt={`Portada de ${event.title}`}
+                  onError={(e) => {
+                    console.error('Error loading event image:', e);
+                    e.currentTarget.src = `https://source.unsplash.com/random/800x400/?${event.category}`;
+                  }}
+                />
+              )
+            ) : (event.photoUrl || event.photo_url) ? (
+              <img 
+                src={event.photoUrl || event.photo_url}
+                className="w-full h-full object-cover"
+                alt={`Portada de ${event.title}`}
+                onError={(e) => {
+                  console.error('Error loading event image:', e);
+                  e.currentTarget.src = `https://source.unsplash.com/random/800x400/?${event.category}`;
+                }}
+              />
+            ) : (
+              <img 
+                src={`https://source.unsplash.com/random/800x400/?${event.category}`}
+                className="w-full h-full object-cover"
+                alt={`Portada de ${event.title}`}
+              />
+            )}
+          </div>
+          
+          {/* Galería de contenido multimedia */}
+          {event.mediaItems && (
+            <div className="mb-5">
+              <h3 className="font-semibold mb-3">Contenido multimedia</h3>
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                {JSON.parse(event.mediaItems).map((item: any, index: number) => (
+                  <div 
+                    key={`media-${index}`} 
+                    className="aspect-square bg-neutral-100 rounded-lg overflow-hidden"
+                  >
+                    {item.type === 'video' ? (
+                      <video 
+                        src={item.url}
+                        className="w-full h-full object-cover"
+                        controls
+                        preload="metadata"
+                      />
+                    ) : (
+                      <img 
+                        src={item.url}
+                        className="w-full h-full object-cover"
+                        alt={`Contenido multimedia de ${event.title}`}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )
+          
+          {/* Organizer info */}
+          <div className="flex items-center justify-between mb-5">
+            <div className="flex items-center gap-3">
+              <Avatar className="w-12 h-12">
+                <img
+                  src={event.organizer?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(event.organizer?.name || 'Organizador')}`}
+                  alt={event.organizer?.name || 'Organizador'}
+                  className="w-full h-full object-cover"
+                />
+              </Avatar>
+              <div>
+                <p className="text-sm text-neutral-500">Organizado por</p>
+                <p className="font-medium">{event.organizer?.name || 'Usuario'}</p>
+              </div>
+            </div>
+            
+            {(isAttending || isOrganizer) && (
+              <Button 
+                variant="outline" 
+                className="bg-primary text-white hover:bg-primary/90 px-4 py-2 rounded-xl flex items-center gap-2"
+                onClick={() => setChatVisible(true)}
+              >
+                <MessageSquare size={16} />
+                <span>Chat del evento</span>
+              </Button>
+            )}
+          </div>
+          
+          {/* Event description */}
+          <div className="mb-5">
+            <h3 className="font-semibold mb-2">Acerca de este evento</h3>
+            <p className="text-neutral-700">{event.description}</p>
+          </div>
+          
+          {/* Event details */}
+          <div className="bg-neutral-50 p-4 rounded-xl mb-5">
+            <div className="flex items-center gap-3 mb-3">
+              <MapPin className="text-neutral-500" />
+              <div>
+                <p className="font-medium">{event.locationName}</p>
+                <p className="text-sm text-neutral-500">{event.locationAddress}</p>
+              </div>
+            </div>
+            
+            <div className="flex items-center gap-3 mb-3">
+              <Users className="text-neutral-500" />
+              <div>
+                <p className="font-medium">{attendeeCount} personas asistentes</p>
+                {spotsLeft !== null && (
+                  <p className="text-sm text-neutral-500">{spotsLeft} lugares disponibles</p>
+                )}
+              </div>
+            </div>
+            
+            {/* Privacy and payment info */}
+            <div className="flex flex-wrap gap-4 mt-3 text-sm">
+              <div className="bg-neutral-100 px-3 py-1.5 rounded-lg text-neutral-700 flex items-center gap-1.5">
+                {event.privacyType === 'public' ? (
+                  <>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-globe">
+                      <circle cx="12" cy="12" r="10"/>
+                      <line x1="2" x2="22" y1="12" y2="12"/>
+                      <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                    </svg>
+                    <span>Evento público</span>
+                  </>
+                ) : (
+                  <>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-lock">
+                      <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                      <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                    </svg>
+                    <span>Evento privado</span>
+                  </>
+                )}
+              </div>
+              
+              <div className="bg-neutral-100 px-3 py-1.5 rounded-lg text-neutral-700 flex items-center gap-1.5">
+                {event.paymentType === 'free' ? (
+                  <>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-ticket">
+                      <path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"/>
+                      <path d="M13 5v2"/>
+                      <path d="M13 17v2"/>
+                      <path d="M13 11v2"/>
+                    </svg>
+                    <span>Gratis</span>
+                  </>
+                ) : (
+                  <>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-banknote">
+                      <rect width="20" height="12" x="2" y="6" rx="2"/>
+                      <circle cx="12" cy="12" r="2"/>
+                      <path d="M6 12h.01M18 12h.01"/>
+                    </svg>
+                    <span>De pago</span>
+                  </>
+                )}
+              </div>
+              
+              {event.maxCapacity && (
+                <div className="bg-neutral-100 px-3 py-1.5 rounded-lg text-neutral-700 flex items-center gap-1.5">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-users">
+                    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+                    <circle cx="9" cy="7" r="4"/>
+                    <path d="M22 21v-2a4 4 0 0 0-3-3.87"/>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                  </svg>
+                  <span>Máximo {event.maxCapacity} personas</span>
+                </div>
+              )}
+            </div>
+          </div>
+          
+          {/* Map location */}
+          <div className="mb-5">
+            <div 
+              ref={mapContainerRef} 
+              className="w-full h-48 rounded-xl overflow-hidden"
+              style={{ border: '1px solid #e5e5e5' }}
+            ></div>
+          </div>
+          
+          {/* Attendees list */}
+          {attendeeCount > 0 && (
+            <div className="mb-5">
+              <h3 className="font-semibold mb-3">Asistentes ({attendeeCount})</h3>
+              <div className="flex flex-wrap gap-2">
+                {safeAttendees.map((attendee) => (
+                  <div key={attendee.id} className="flex items-center gap-2 bg-neutral-50 rounded-full py-1 pl-1 pr-3">
+                    <Avatar className="h-6 w-6">
+                      <img
+                        src={attendee.user?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(attendee.user?.name || 'Usuario')}`}
+                        alt={attendee.user?.name || 'Usuario'}
+                        className="h-full w-full object-cover"
+                      />
+                    </Avatar>
+                    <span className="text-sm">{attendee.user?.name || 'Usuario'}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          
+          {/* Join event button */}
+          <div className="flex items-center justify-between mb-2">
+            <div>
+              {!isOrganizer ? (
+                <>
+                  <p className="font-bold text-xl">{event.paymentType === 'free' ? 'Gratis' : `$${Number(event.price || 0).toFixed(2)}`}</p>
+                  <p className="text-sm text-neutral-500">por persona</p>
+                </>
+              ) : (
+                <div className="flex items-center gap-2 bg-neutral-100 text-neutral-700 rounded-full py-1.5 px-3">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path>
+                    <circle cx="9" cy="7" r="4"></circle>
+                    <path d="M22 21v-2a4 4 0 0 0-3-3.87"></path>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                  </svg>
+                  <span>Eres el Organizador</span>
+                </div>
+              )}
+            </div>
+            
+            {!isOrganizer && !isAttending && joinRequestStatus !== 'pending' && (
+              <Button 
+                className="px-6 py-3 bg-primary text-white font-semibold rounded-xl"
+                onClick={handleJoinEvent}
+              >
+                {event.privacyType === 'private' 
+                  ? 'Solicitar Unirse' 
+                  : event.paymentType === 'paid' && event.price 
+                    ? `Unirse por ${formatPrice(event.price)}`
+                    : 'Unirse al Evento'}
+              </Button>
+            )}
+            
+            {joinRequestStatus === 'pending' && (
+              <div className="flex flex-col space-y-2">
+                <div className="bg-amber-100 text-amber-800 px-4 py-3 rounded-xl flex items-center gap-2">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M10.42 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10.42"></path>
+                    <path d="M18 18m-3 0a3 3 0 1 0 6 0a3 3 0 1 0 -6 0"></path>
+                    <path d="M18 14.5V21"></path>
+                  </svg>
+                  <span>Solicitud pendiente de aprobación</span>
+                </div>
+                <Button 
+                  variant="destructive"
+                  className="px-6 py-2 text-sm rounded-xl"
+                  onClick={handleLeaveEvent}
+                >
+                  Cancelar Solicitud
+                </Button>
+              </div>
+            )}
+            
+            {isAttending && joinRequestStatus !== 'pending' && (
+              <Button 
+                variant="destructive"
+                className="px-6 py-3 font-semibold rounded-xl"
+                onClick={handleLeaveEvent}
+              >
+                Abandonar Evento
+              </Button>
+            )}
+            
+            {isOrganizer && (
+              <div className="space-y-4">
+                <div className="flex items-center justify-center gap-2">
+                  <Button 
+                    variant="outline"
+                    className="border-primary text-primary px-6 py-3 font-semibold rounded-xl"
+                    onClick={() => setEditFormVisible(true)}
+                  >
+                    Administrar
+                  </Button>
+                  
+                  {event.privacyType === 'private' && (
+                    <Button 
+                      variant="outline"
+                      className="flex items-center gap-1"
+                      onClick={() => setShowRequests(!showRequests)}
+                    >
+                      <UserPlus size={18} />
+                      <span>Solicitudes</span>
+                    </Button>
+                  )}
+                </div>
+                
+                {/* Event requests management section */}
+                {showRequests && event.privacyType === 'private' && (
+                  <div className="mt-6 border rounded-lg p-4 bg-neutral-50">
+                    <EventRequests 
+                      eventId={event.id} 
+                      onStatusChange={() => {
+                        // Refrescar los datos al cambiar el estado de una solicitud
+                        toast({
+                          title: "Actualizado",
+                          description: "La solicitud ha sido procesada exitosamente"
+                        });
+                      }} 
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+};
+
+export default EventDetailSheet;

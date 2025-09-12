@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Auth Debug</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        button { margin: 10px; padding: 10px; }
+        #output { border: 1px solid #ccc; padding: 10px; margin: 10px 0; min-height: 200px; }
+    </style>
+</head>
+<body>
+    <h1>Authentication Debug Tool</h1>
+    <button onclick="testLocalStorage()">Test LocalStorage</button>
+    <button onclick="testLogin()">Test Login Flow</button>
+    <button onclick="testStoredToken()">Test Stored Token</button>
+    <button onclick="clearStorage()">Clear Storage</button>
+    <div id="output"></div>
+
+    <script>
+        function log(message) {
+            const output = document.getElementById('output');
+            output.innerHTML += new Date().toLocaleTimeString() + ': ' + message + '<br>';
+            console.log(message);
+        }
+
+        function testLocalStorage() {
+            log('Testing localStorage functionality...');
+            try {
+                const testKey = 'test_storage_key';
+                const testValue = 'test_storage_value_' + Date.now();
+                
+                localStorage.setItem(testKey, testValue);
+                const retrieved = localStorage.getItem(testKey);
+                localStorage.removeItem(testKey);
+                
+                if (retrieved === testValue) {
+                    log('✓ LocalStorage test PASSED');
+                } else {
+                    log('✗ LocalStorage test FAILED - retrieval mismatch');
+                }
+            } catch (error) {
+                log('✗ LocalStorage test FAILED: ' + error.message);
+            }
+        }
+
+        async function testLogin() {
+            log('Testing login flow...');
+            try {
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        email: 'facundoroman203@gmail.com',
+                        password: '123456'
+                    }),
+                });
+
+                const data = await response.json();
+                
+                if (response.ok && data.token) {
+                    log('✓ Login API successful');
+                    log('Token received: ' + data.token.substring(0, 30) + '...');
+                    
+                    // Test immediate storage
+                    const tokenKey = 'pipol_auth_token';
+                    localStorage.setItem(tokenKey, data.token);
+                    
+                    // Verify storage immediately
+                    const stored = localStorage.getItem(tokenKey);
+                    if (stored === data.token) {
+                        log('✓ Token stored successfully');
+                        
+                        // Test token with auth endpoint
+                        const authTest = await fetch('/api/auth/me', {
+                            headers: {
+                                'Authorization': 'Bearer ' + data.token,
+                                'Content-Type': 'application/json'
+                            }
+                        });
+                        
+                        if (authTest.ok) {
+                            const userData = await authTest.json();
+                            log('✓ Token validation successful - User: ' + userData.name);
+                        } else {
+                            log('✗ Token validation failed: ' + authTest.status);
+                        }
+                    } else {
+                        log('✗ Token storage failed');
+                    }
+                } else {
+                    log('✗ Login failed: ' + (data.message || 'Unknown error'));
+                }
+            } catch (error) {
+                log('✗ Login error: ' + error.message);
+            }
+        }
+
+        async function testStoredToken() {
+            log('Testing stored token...');
+            const token = localStorage.getItem('pipol_auth_token');
+            
+            if (!token) {
+                log('✗ No token found in storage');
+                return;
+            }
+            
+            log('Found stored token: ' + token.substring(0, 30) + '...');
+            
+            try {
+                const response = await fetch('/api/auth/me', {
+                    headers: {
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                if (response.ok) {
+                    const userData = await response.json();
+                    log('✓ Stored token works - User: ' + userData.name);
+                } else {
+                    log('✗ Stored token invalid: ' + response.status);
+                }
+            } catch (error) {
+                log('✗ Error testing stored token: ' + error.message);
+            }
+        }
+
+        function clearStorage() {
+            localStorage.removeItem('pipol_auth_token');
+            localStorage.removeItem('pipol_user_data');
+            log('✓ Storage cleared');
+        }
+    </script>
+</body>
+</html>

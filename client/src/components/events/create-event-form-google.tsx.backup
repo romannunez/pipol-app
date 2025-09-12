@@ -1,0 +1,1610 @@
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { useForm, FieldValues } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { useToast } from "@/hooks/use-toast";
+import { apiRequest } from "@/lib/queryClient";
+import { ArrowLeft, MapIcon, Compass, Search } from "lucide-react";
+import { useAuth } from "@/hooks/use-auth";
+import { useLocation } from "wouter";
+import { GoogleMap, Marker, useLoadScript, Libraries } from '@react-google-maps/api';
+import { GOOGLE_MAPS_API_KEY, reverseGeocode, defaultMapConfig } from "@/lib/google-maps";
+import MediaManager, { MediaItem } from "./media-manager-v2";
+
+// Definición centralizada de categorías para reutilización
+const EVENT_CATEGORIES = [
+  { value: 'social', label: 'Social' },
+  { value: 'music', label: 'Música' },
+  { value: 'spiritual', label: 'Espiritual' },
+  { value: 'education', label: 'Educación' },
+  { value: 'sports', label: 'Deportes' },
+  { value: 'food', label: 'Comida' },
+  { value: 'art', label: 'Arte' },
+  { value: 'technology', label: 'Tecnología' },
+  { value: 'games', label: 'Juegos' },
+  { value: 'outdoor', label: 'Aire Libre' },
+  { value: 'networking', label: 'Networking' },
+  { value: 'workshop', label: 'Talleres' },
+  { value: 'conference', label: 'Conferencias' },
+  { value: 'party', label: 'Fiestas' },
+  { value: 'fair', label: 'Ferias' },
+  { value: 'exhibition', label: 'Exposiciones' }
+];
+
+// Form schema para validación de eventos
+const createEventSchema = z.object({
+  title: z.string().min(3, "El título debe tener al menos 3 caracteres"),
+  description: z.string().min(10, "La descripción debe tener al menos 10 caracteres"),
+  category: z.string().min(1, "Por favor, selecciona una categoría"),
+  date: z.string().min(1, "Por favor, selecciona una fecha"),
+  time: z.string().min(1, "Por favor, selecciona una hora"),
+  latitude: z.string().or(z.number()),
+  longitude: z.string().or(z.number()),
+  locationName: z.string().min(3, "El nombre del lugar debe tener al menos 3 caracteres"),
+  locationAddress: z.string().min(5, "La dirección debe tener al menos 5 caracteres"),
+  paymentType: z.string().min(1, "Por favor, selecciona un tipo de pago"),
+  price: z.string().optional(),
+  maxCapacity: z.string().optional(),
+  privacyType: z.string().min(1, "Por favor, selecciona un tipo de privacidad"),
+  privateAccessType: z.enum(['solicitud', 'postulacion', 'paga']).optional(),
+  applicationQuestions: z.string().optional(),
+
+  // Campo para gestión multimedia unificada
+  mediaItems: z.array(
+    z.object({
+      id: z.string().optional(),
+      type: z.enum(['photo', 'video']),
+      url: z.string().optional(),
+      file: z.instanceof(File).optional(),
+      isMain: z.boolean().optional(),
+      isNew: z.boolean().optional(),
+      deleted: z.boolean().optional(),
+      toDelete: z.boolean().optional(),
+      order: z.number().optional(),
+    })
+  ).default([]),
+  
+  // Campos para carga directa de archivos (mantener por compatibilidad)
+  eventPhotos: z.array(z.instanceof(File)).optional().default([]),
+  eventVideos: z.array(z.instanceof(File)).optional().default([]),
+  eventPhoto: z.instanceof(File).optional().nullable(),
+  eventVideo: z.instanceof(File).optional().nullable(),
+  mainMediaFile: z.instanceof(File).optional().nullable(),
+  mainMediaType: z.string().optional(),
+});
+
+// Tipos para props y datos
+type LocationData = {
+  latitude: number;
+  longitude: number;
+  locationName: string;
+  locationAddress: string;
+};
+
+type CreateEventFormProps = {
+  onClose: () => void;
+  visible: boolean;
+  initialLocation?: LocationData | null;
+};
+
+// Define el tipo extendido para compatibilidad con todo el formulario
+type FormValues = z.infer<typeof createEventSchema> & {
+  mediaItems: MediaItem[];
+  eventPhoto?: File;
+  eventVideo?: File;
+  eventPhotos?: File[];
+  eventVideos?: File[];
+  mainMediaFile?: File;
+  mainMediaType?: string;
+};
+
+// Librerias de Google Maps
+const libraries: Libraries = ["places"];
+
+/**
+ * Componente CreateEventForm - Formulario para crear nuevos eventos
+ */
+/**
+ * CreateEventFormGoogle con manejo mejorado de ciclo de vida para evitar problemas
+ * al cerrar el formulario. El componente se destruye completamente al cerrarse.
+ */
+const CreateEventFormGoogle = ({ onClose, visible, initialLocation }: CreateEventFormProps) => {
+  console.log("Creando instancia de CreateEventFormGoogle");
+  // Estados principales
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  
+  // Cuando el componente va a ser desmontado, limpiar cualquier estado o efecto pendiente
+  useEffect(() => {
+    return () => {
+      console.log("Desmontando CreateEventFormGoogle - limpiando recursos");
+      // La función onClose ya habrá sido llamada desde el botón o desde otro lugar
+      // Este es solo un lugar adicional para asegurar la limpieza completa
+    };
+  }, []);
+  
+  // Inicializar ubicación - Mostrar ubicación seleccionada o la ubicación predeterminada
+  const defaultLocation = {
+    lat: 19.4326, // Ciudad de México por defecto
+    lng: -99.1332
+  };
+  
+  // Usar ubicación inicial si existe, o la predeterminada
+  const [center, setCenter] = useState(
+    initialLocation 
+      ? { lat: initialLocation.latitude, lng: initialLocation.longitude } 
+      : defaultLocation
+  );
+  
+  // Configurar el marcador con la misma ubicación inicial
+  const [markerPosition, setMarkerPosition] = useState(
+    initialLocation 
+      ? { lat: initialLocation.latitude, lng: initialLocation.longitude } 
+      : defaultLocation
+  );
+  
+  // Establecer el paso inicial - Si hay ubicación inicial, ir al paso 2
+  const [step, setStep] = useState<1 | 2>(1);
+  
+  // Cargar Google Maps
+  const { isLoaded, loadError } = useLoadScript({
+    googleMapsApiKey: GOOGLE_MAPS_API_KEY,
+    libraries,
+  });
+  
+  // Hooks y referencias
+  const { toast } = useToast();
+  const { user, isLoading } = useAuth();
+  const [_, navigate] = useLocation();
+  const mapRef = useRef<google.maps.Map | null>(null);
+  
+  // Inicializar formulario con valores iniciales y resolver problemas de tipos
+  const form = useForm<FormValues, any, FormValues>({
+    resolver: zodResolver(createEventSchema),
+    defaultValues: {
+      title: "",
+      description: "",
+      category: "",
+      date: "",
+      time: "",
+      // Asegurarnos de que las coordenadas se traten como números
+      latitude: initialLocation ? parseFloat(String(initialLocation.latitude)) : "",
+      longitude: initialLocation ? parseFloat(String(initialLocation.longitude)) : "",
+      locationName: initialLocation?.locationName || "",
+      locationAddress: initialLocation?.locationAddress || "",
+      paymentType: "free",
+      price: "",
+      maxCapacity: "",
+      privacyType: "public",
+      privateAccessType: "solicitud", // Valor predeterminado cuando privacyType es "private"
+      applicationQuestions: "",
+
+      mediaItems: [],
+      eventPhotos: [],
+      eventVideos: [],
+      eventPhoto: undefined,
+      eventVideo: undefined,
+      mainMediaFile: undefined,
+      mainMediaType: undefined,
+    },
+  });
+
+  // Verificar autenticación
+  useEffect(() => {
+    if (!isLoading && !user) {
+      toast({
+        title: "Autenticación Requerida",
+        description: "Por favor, inicia sesión para crear eventos",
+        variant: "destructive",
+      });
+      navigate("/login");
+    }
+  }, [user, isLoading, toast, navigate]);
+  
+  // Efecto para actualizar el paso y valores del formulario cuando cambia la ubicación inicial
+  useEffect(() => {
+    if (initialLocation) {
+      console.log("Recibida ubicación inicial:", initialLocation);
+      
+      // Verificar que las coordenadas sean válidas antes de continuar
+      const lat = Number(initialLocation.latitude);
+      const lng = Number(initialLocation.longitude);
+      
+      if (isNaN(lat) || isNaN(lng)) {
+        console.error("Coordenadas inválidas recibidas:", {
+          latitude: initialLocation.latitude,
+          longitude: initialLocation.longitude,
+          tipoLat: typeof initialLocation.latitude,
+          tipoLng: typeof initialLocation.longitude
+        });
+        
+        toast({
+          title: "Error en coordenadas",
+          description: "Las coordenadas recibidas no son válidas. Por favor intenta seleccionar otra ubicación.",
+          variant: "destructive"
+        });
+        
+        // No avanzar al paso 2 si las coordenadas no son válidas
+        return;
+      }
+      
+      // Actualizar los valores del formulario explícitamente
+      form.setValue("latitude", lat);
+      form.setValue("longitude", lng);
+      form.setValue("locationName", initialLocation.locationName || "");
+      form.setValue("locationAddress", initialLocation.locationAddress || "");
+      
+      // También actualizar el estado del mapa y el marcador con la nueva ubicación
+      setCenter({ lat, lng });
+      setMarkerPosition({ lat, lng });
+      
+      console.log("Formulario actualizado con valores:", {
+        lat: form.getValues("latitude"),
+        lng: form.getValues("longitude"),
+        tipoLat: typeof form.getValues("latitude"),
+        tipoLng: typeof form.getValues("longitude")
+      });
+      
+      // Establecer al paso 2 solo cuando recibimos coordenadas válidas
+      setStep(2);
+    }
+  }, [initialLocation, form, toast]);
+
+  // Callback para guardar la referencia del mapa
+  const onMapLoad = useCallback((map: google.maps.Map) => {
+    mapRef.current = map;
+  }, []);
+
+  // Manejar click en el mapa
+  const handleMapClick = useCallback((event: google.maps.MapMouseEvent) => {
+    if (event.latLng) {
+      const lat = event.latLng.lat();
+      const lng = event.latLng.lng();
+      
+      setMarkerPosition({ lat, lng });
+      
+      // Guardar como números, no strings
+      form.setValue("latitude", lat);
+      form.setValue("longitude", lng);
+      
+      // Obtener dirección y detalles del lugar
+      reverseGeocode(lng, lat).then(async address => {
+        console.log("Dirección geocodificada inversamente:", address);
+        
+        // Intentar obtener el nombre del lugar usando Places API si está disponible
+        try {
+          // Crear el servicio de Places
+          if (window.google && window.google.maps && window.google.maps.places) {
+            const placesService = new window.google.maps.places.PlacesService(document.createElement('div'));
+            
+            // Buscar lugares cercanos a las coordenadas donde se hizo clic
+            const request = {
+              location: new window.google.maps.LatLng(lat, lng),
+              radius: 100, // Buscar en un radio de 100 metros
+              type: 'establishment' // Priorizar establecimientos - debe ser un string, no un array
+            };
+            
+            // Promisificar la llamada a nearbySearch
+            const nearbyPlaces = await new Promise<google.maps.places.PlaceResult[]>((resolve, reject) => {
+              placesService.nearbySearch(request, (results, status) => {
+                if (status === window.google.maps.places.PlacesServiceStatus.OK && results) {
+                  resolve(results);
+                } else {
+                  reject(new Error(`Places API error: ${status}`));
+                }
+              });
+            });
+            
+            // Si encontramos establecimientos cercanos, usar el nombre del primero
+            if (nearbyPlaces && nearbyPlaces.length > 0) {
+              console.log("Lugares encontrados cerca:", nearbyPlaces);
+              const placeResult = nearbyPlaces[0];
+              const placeName = placeResult.name || address.split(',')[0];
+              
+              form.setValue("locationAddress", address);
+              form.setValue("locationName", placeName);
+              
+              toast({
+                title: "Ubicación seleccionada",
+                description: placeName,
+              });
+              return;
+            }
+          }
+        } catch (placesError) {
+          console.error("Error al buscar lugares cercanos:", placesError);
+          // Continuar con el enfoque predeterminado si falla
+        }
+        
+        // Método predeterminado: usar la primera parte de la dirección
+        const locationName = address.split(',')[0] || "Lugar del evento";
+        form.setValue("locationAddress", address);
+        form.setValue("locationName", locationName);
+        
+        toast({
+          title: "Ubicación seleccionada",
+          description: "Ubicación guardada correctamente",
+        });
+      }).catch(error => {
+        console.error("Error obteniendo dirección:", error);
+        form.setValue("locationAddress", "Dirección no disponible");
+        form.setValue("locationName", "Lugar del evento");
+      });
+    }
+  }, [form, toast]);
+
+  // Validar ubicación antes de continuar al paso 2
+  const validateAndContinue = async () => {
+    // Log para depuración
+    console.log("Validando ubicación:", {
+      latitude: form.getValues("latitude"),
+      longitude: form.getValues("longitude"),
+      tipo_lat: typeof form.getValues("latitude"),
+      tipo_lng: typeof form.getValues("longitude")
+    });
+    
+    if (!form.getValues("latitude") || !form.getValues("longitude")) {
+      toast({
+        title: "Selecciona una ubicación",
+        description: "Haz clic en el mapa para seleccionar dónde se realizará el evento",
+        variant: "destructive"
+      });
+      return;
+    }
+    
+    // Si falta nombre o dirección, intentar obtenerlos
+    if (!form.getValues("locationName") || !form.getValues("locationAddress")) {
+      try {
+        // Siempre convertimos explícitamente a string y luego a número para evitar problemas de tipo
+        const lngValue = form.getValues("longitude");
+        const latValue = form.getValues("latitude");
+        const lng = typeof lngValue === 'string' ? parseFloat(lngValue) : lngValue;
+        const lat = typeof latValue === 'string' ? parseFloat(latValue) : latValue;
+        
+        const address = await reverseGeocode(lng, lat);
+        
+        const locationName = address.split(',')[0] || "Lugar del evento";
+        form.setValue("locationAddress", address);
+        form.setValue("locationName", locationName);
+      } catch (error) {
+        // Si falla, usar valores por defecto
+        form.setValue("locationAddress", "Dirección no disponible");
+        form.setValue("locationName", "Lugar del evento");
+      }
+    }
+    
+    // Avanzar al siguiente paso con animación
+    changeStep(2);
+  };
+
+  // Estados eliminados - ya no se usan URLs para imágenes y videos
+  
+  // Enviar formulario al servidor
+  const onSubmit = async (data: FormValues) => {
+    // Verificación previa para prevenir el error "undefined"
+    if (!data || typeof data !== 'object') {
+      console.error("Datos del formulario inválidos:", data);
+      toast({
+        title: "Error en formulario",
+        description: "Los datos del formulario no son válidos. Por favor, inténtalo de nuevo.",
+        variant: "destructive",
+      });
+      return;
+    }
+    
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    
+    try {
+      // Preparar datos para la API
+      const dateTime = new Date(`${data.date}T${data.time}`);
+      
+      // Log valores originales antes de procesamiento
+      console.log("Valores originales del formulario:", {
+        latitude: data.latitude,
+        longitude: data.longitude,
+        tipo_lat: typeof data.latitude,
+        tipo_lng: typeof data.longitude,
+        eventPhoto: data.eventPhoto ? "Archivo presente" : "No hay archivo",
+        eventVideo: data.eventVideo ? "Archivo presente" : "No hay archivo"
+      });
+      
+      // Crear FormData para enviar archivos
+      const formData = new FormData();
+      
+      // Verificar qué archivos multimedia hay - con verificación de nulos
+      console.log("Archivos multimedia a enviar:", 
+        Array.isArray(data.mediaItems) ? data.mediaItems.filter(item => item).map(item => {
+          return {
+            type: item.type || 'desconocido',
+            isMain: item.isMain || false,
+            file: item.file ? `${item.file.name} (${item.file.size} bytes)` : 'Sin archivo',
+            deleted: item.deleted,
+            toDelete: item.toDelete
+          };
+        }) : []
+      );
+      
+      // Añadir campos básicos
+      formData.append('title', data.title);
+      formData.append('description', data.description);
+      formData.append('category', data.category);
+      formData.append('date', dateTime.toISOString());
+      formData.append('latitude', String(Number(data.latitude)));
+      formData.append('longitude', String(Number(data.longitude)));
+      formData.append('locationName', data.locationName);
+      formData.append('locationAddress', data.locationAddress);
+      formData.append('paymentType', "free"); // Siempre eventos gratuitos
+      formData.append('price', "0"); // Sin precio
+      formData.append('privacyType', data.privacyType);
+      
+      // Añadir tipo de acceso privado y preguntas si el evento es privado
+      if (data.privacyType === 'private' && data.privateAccessType) {
+        formData.append('privateAccessType', data.privateAccessType);
+        
+        // Si es de tipo postulación, añadir las preguntas para los aplicantes
+        if (data.privateAccessType === 'postulacion' && data.applicationQuestions) {
+          formData.append('applicationQuestions', data.applicationQuestions);
+        }
+      }
+      
+      // ===== MEJORA CRÍTICA: PROCESAR ARCHIVO PRINCIPAL =====
+      // Identificar explícitamente el elemento principal con validación mejorada para prevenir "undefined"
+      let mainItem = null;
+      try {
+        if (data && data.mediaItems && Array.isArray(data.mediaItems)) {
+          mainItem = data.mediaItems.find(item => 
+            item && typeof item === 'object' && item.isMain === true && 
+            item.deleted !== true && item.toDelete !== true);
+        }
+      } catch (error) {
+        console.error("Error al procesar mediaItems para encontrar el elemento principal:", error);
+      }
+      
+      console.log("===== PROCESANDO ARCHIVO PRINCIPAL =====");
+      console.log("mainItem encontrado:", mainItem ? "SÍ" : "NO");
+      
+      // Verificación segura de las propiedades para prevenir error "Cannot read property of undefined"
+      if (mainItem && mainItem.file && typeof mainItem.file === 'object') {
+        console.log("Archivo principal identificado:", mainItem.file.name || "sin nombre");
+        console.log("Tipo:", mainItem.type || "tipo desconocido");
+        
+        // Agregar como mainMediaFile explícitamente
+        formData.append('mainMediaFile', mainItem.file);
+        formData.append('mainMediaType', mainItem.type || 'photo'); // Valor por defecto
+        console.log("==> Archivo principal agregado como 'mainMediaFile'");
+      } else if (mainItem && mainItem.url && typeof mainItem.url === 'string') {
+        console.log("===== PROCESANDO URL PRINCIPAL (EXISTENTE) =====");
+        console.log("URL principal identificada:", mainItem.url);
+        formData.append('mainMediaUrl', mainItem.url);
+        formData.append('mainMediaType', mainItem.type || 'photo'); // Valor por defecto
+      }
+      
+      // Añadir capacidad máxima si existe
+      if (data.maxCapacity) {
+        formData.append('maxCapacity', String(Number(data.maxCapacity)));
+      }
+      
+      // Eliminadas referencias a URLs
+      
+      // Actualizar el estado de los medios para mostrar indicadores de carga
+      // Verificamos que mediaItems sea un array y filtramos null/undefined
+      const mediaItemsWithLoading = Array.isArray(data.mediaItems) ? 
+        data.mediaItems
+          .filter(item => item !== null && item !== undefined)
+          .map(item => {
+            if (item && item.file && !item.deleted && !item.toDelete) {
+              return {
+                ...item,
+                uploading: true,
+                uploadProgress: 0
+              };
+            }
+            return item;
+          }) : [];
+      
+      // Actualizar el formulario con los estados de carga
+      form.setValue('mediaItems', mediaItemsWithLoading);
+      
+      // Procesar medios desde mediaItems
+      const mediaItemsArray: Array<{type: string, url?: string, isMain: boolean, order: number}> = [];
+      
+      // Buscar el elemento marcado como principal (con manejo avanzado de errores)
+      let mainMediaItem = null;
+      try {
+        if (data && data.mediaItems && Array.isArray(data.mediaItems)) {
+          mainMediaItem = data.mediaItems.find(
+            item => item && typeof item === 'object' && item.isMain === true && 
+            item.deleted !== true && item.toDelete !== true
+          );
+        }
+      } catch (error) {
+        console.error("Error al buscar elemento principal:", error);
+        mainMediaItem = null;
+      }
+      
+      console.log("=== VERIFICACIÓN DE ELEMENTO PRINCIPAL ANTES DE ENVIAR ===");
+      if (mainMediaItem) {
+        console.log("Elemento principal encontrado:", {
+          id: mainMediaItem.id || "nuevo",
+          tipo: mainMediaItem.type,
+          archivo: mainMediaItem.file ? mainMediaItem.file.name : (mainMediaItem.url || "sin archivo")
+        });
+      } else {
+        console.log("No se encontró un elemento principal explícito");
+      }
+      console.log("==========================================================");
+      
+      // Verificar que exista un elemento principal
+      if (!mainMediaItem && data.mediaItems.length > 0) {
+        // Si no hay un elemento principal marcado pero hay elementos, seleccionamos el primero como principal
+        const nonDeletedItems = data.mediaItems.filter(item => !item.deleted && !item.toDelete);
+        
+        if (nonDeletedItems.length > 0) {
+          // Buscar primero una foto para establecer como principal (prioridad para fotos)
+          const firstPhoto = nonDeletedItems.find(item => item.type === 'photo');
+          const itemToSetMain = firstPhoto || nonDeletedItems[0];
+          
+          console.log("Seleccionando elemento principal automáticamente:", {
+            id: itemToSetMain.id || "nuevo",
+            tipo: itemToSetMain.type,
+            archivo: itemToSetMain.file ? itemToSetMain.file.name : (itemToSetMain.url || "sin archivo")
+          });
+          
+          // Crear una nueva lista con el elemento principal actualizado
+          const updatedItems = data.mediaItems.map(item => {
+            // Crear copias completas para evitar problemas de referencia
+            if (item === itemToSetMain) {
+              return { ...item, isMain: true };
+            }
+            return { ...item, isMain: false };
+          });
+          
+          // Actualizar el estado en el formulario
+          form.setValue('mediaItems', updatedItems);
+          
+          console.log("Estado del formulario actualizado con nuevo elemento principal");
+        }
+      }
+      
+      // Convertir mediaItems a JSON para enviar al servidor (con más información de depuración)
+      // Aseguramos que data.mediaItems exista y sea un array antes de procesarlo
+      const mediaItemsForServer = (data.mediaItems || [])
+        .filter(item => item && !item.deleted && !item.toDelete)
+        .map((item, idx) => ({
+          type: item.type,
+          isMain: !!item.isMain, // Asegurarse de que sea booleano
+          order: idx,
+          // Incluir ID si existe (para elementos existentes en edición)
+          id: item.id
+        }));
+      
+      // VERIFICACIÓN CRÍTICA: Comprobar si hay un elemento principal marcado explícitamente
+      // Con validación para prevenir errores undefined
+      const mainItemForServer = Array.isArray(mediaItemsForServer) ? 
+        mediaItemsForServer.find(item => item && item.isMain === true) : null;
+      
+      console.log("=== VERIFICACIÓN FINAL ELEMENTO PRINCIPAL AL ENVIAR ===");
+      if (mainItemForServer) {
+        console.log("ENCONTRADO elemento principal explícito:");
+        console.log("ID:", mainItemForServer.id || "nuevo");
+        console.log("Tipo:", mainItemForServer.type);
+        console.log("isMain:", mainItemForServer.isMain);
+        console.log("================================");
+      } else {
+        console.warn("⚠️ No se encontró ningún elemento marcado como principal. Usando el primero por defecto.");
+        // Si no hay ninguno marcado como principal, marcar el primero explícitamente
+        if (Array.isArray(mediaItemsForServer) && mediaItemsForServer.length > 0) {
+          // Actualizar tanto el array de servidor como el mainMediaFile
+          console.log("Marcando primer elemento como principal forzosamente:", mediaItemsForServer[0]);
+          mediaItemsForServer[0].isMain = true;
+          
+          // Encontramos el archivo original si existe
+          const originalItem = Array.isArray(data.mediaItems) ? 
+            data.mediaItems.find(item => 
+              item && 
+              (mediaItemsForServer[0] && item.id === mediaItemsForServer[0].id || 
+              (item.file && mediaItemsForServer[0] && mediaItemsForServer[0].id === undefined))
+            ) : null;
+          
+          if (originalItem && originalItem.file) {
+            console.log("Actualizando mainMediaFile con:", originalItem.file.name);
+            // Forzar la actualización de mainMediaFile directamente
+            form.setValue('mainMediaFile', originalItem.file);
+            form.setValue('mainMediaType', originalItem.type || 'photo'); // Valor por defecto si no existe
+          } else {
+            // Si no hay un elemento original, aseguremos que mainMediaFile y mainMediaType tengan valores válidos
+            // para prevenir errores "undefined"
+            console.log("No se encontró archivo original para el elemento principal");
+            form.setValue('mainMediaFile', undefined);
+            form.setValue('mainMediaType', 'photo'); // Valor por defecto seguro
+          }
+        }
+      }
+      
+      // Log adicional
+      console.log("mainMediaFile:", form.getValues('mainMediaFile'));
+      console.log("mainMediaType:", form.getValues('mainMediaType'));
+      
+      // Asegurarse de que mediaItemsForServer sea siempre un array válido
+      const safeMediaItemsForServer = Array.isArray(mediaItemsForServer) ? mediaItemsForServer : [];
+      console.log("mediaItems preparados para el servidor:", safeMediaItemsForServer);
+      
+      // Usar el array seguro para evitar errores "undefined"
+      formData.append('mediaItems', JSON.stringify(safeMediaItemsForServer));
+      
+      // Recorrer todos los elementos para procesar los archivos
+      // Verificamos que mediaItems sea un array antes de procesarlo
+      const validItems = Array.isArray(data.mediaItems) ? 
+        data.mediaItems.filter(item => item && !item.deleted && !item.toDelete) : [];
+      
+      console.log(`Procesando ${validItems.length} elementos multimedia válidos`);
+      
+      validItems.forEach((item, index) => {
+        // Procesar archivos nuevos con seguridad contra null/undefined
+        if (item && item.file) {
+          // Crear una función para actualizar el progreso de este elemento
+          const updateProgress = (progress: number) => {
+            // Verificar que mediaItems existe y es un array
+            const currentItems = form.getValues('mediaItems');
+            if (!Array.isArray(currentItems)) {
+              console.warn("mediaItems no es un array al actualizar progreso");
+              return;
+            }
+            
+            const newItems = [...currentItems];
+            // Verificar que data.mediaItems existe y es un array
+            const originalIndex = Array.isArray(data.mediaItems) ? 
+              data.mediaItems.findIndex(i => i && item && i.id === item.id) : -1;
+              
+            if (originalIndex >= 0 && newItems[originalIndex]) {
+              newItems[originalIndex] = { 
+                ...newItems[originalIndex], 
+                uploadProgress: progress 
+              } as MediaItem & { uploadProgress: number };
+              form.setValue('mediaItems', newItems);
+            }
+          };
+          
+          // Simular progreso de carga para mejor UX (el progreso real no es posible con fetch nativo)
+          const progressInterval = setInterval(() => {
+            // Verificar que data.mediaItems existe y es un array
+            const originalIndex = Array.isArray(data.mediaItems) ? 
+              data.mediaItems.findIndex(i => i && item && i.id === item.id) : -1;
+              
+            if (originalIndex >= 0) {
+              const items = form.getValues('mediaItems');
+              if (!Array.isArray(items) || !items[originalIndex]) {
+                clearInterval(progressInterval);
+                return;
+              }
+              
+              const currentProgress = items[originalIndex].uploadProgress || 0;
+              if (currentProgress < 90) {
+                updateProgress(currentProgress + 10);
+              } else {
+                clearInterval(progressInterval);
+              }
+            } else {
+              clearInterval(progressInterval);
+            }
+          }, 500);
+          
+          console.log(`Añadiendo archivo multimedia: mediaFile_${index} - ${item.type} - ${item.file.name} (${item.file.size} bytes)`);
+          
+          // Añadir el archivo al campo específico según su índice - ESTO ES CRÍTICO
+          // El nombre del campo debe coincidir exactamente con lo que espera el backend
+          formData.append(`mediaFile_${index}`, item.file);
+          
+          // Si este es el elemento principal, configurar mainMediaFile y tipo
+          if (item.isMain) {
+            console.log(`Archivo principal detectado: ${item.type} - ${item.file.name}`);
+            formData.append('mainMediaFile', item.file);
+            formData.append('mainMediaType', item.type);
+            
+            // También establecer para compatibilidad con backend (sin duplicar archivos)
+            if (item.type === 'photo') {
+              // No añadimos aquí el archivo para evitar duplicación
+              formData.append('eventPhoto', 'photo_main_reference');
+            } else if (item.type === 'video') {
+              // No añadimos aquí el archivo para evitar duplicación
+              formData.append('eventVideo', 'video_main_reference');
+            }
+          } else {
+            // Solo añadir a las colecciones si NO es el archivo principal
+            // Esto evita la duplicación de archivos
+            if (item.type === 'photo') {
+              formData.append('photos', item.file);
+              console.log(`Agregando nueva foto al formulario: ${item.file.name}`);
+            } else if (item.type === 'video') {
+              formData.append('videos', item.file);
+              console.log(`Agregando nuevo video al formulario: ${item.file.name}`);
+            }
+          }
+          
+          // Solo mostrar mensaje si es el principal
+          if (item.isMain) {
+            console.log(`Estableciendo elemento principal: ${item.type} - ${item.file.name}`);
+          }
+        } else {
+          console.log(`Elemento sin archivo: ${item.type} - ${item.id || 'sin ID'}`);
+        }
+      });
+      
+      // Procesar fotos y videos para compatibilidad con el código anterior
+      const photos: File[] = [];
+      const videos: File[] = [];
+      let mainMediaFile: File | null = null;
+      let mainMediaType: string | null = null;
+      
+      // Primero, buscar explícitamente el elemento marcado como principal
+      // Buscar elemento principal con protección contra errores
+      let mainItemOnSubmit = null;
+      try {
+        if (data && data.mediaItems && Array.isArray(data.mediaItems)) {
+          mainItemOnSubmit = data.mediaItems.find(item => 
+            item && typeof item === 'object' && 
+            item.isMain === true && item.file && 
+            !item.deleted && !item.toDelete
+          );
+        }
+      } catch (error) {
+        console.error("Error al buscar elemento principal para submit:", error);
+        mainItemOnSubmit = null;
+      }
+      
+      // Si hay un elemento marcado como principal, usarlo inmediatamente con validación
+      if (mainItemOnSubmit && mainItemOnSubmit.file && 
+          typeof mainItemOnSubmit.file === 'object' && 
+          typeof mainItemOnSubmit.type === 'string') {
+        
+        const file = mainItemOnSubmit.file;
+        console.log("ENCONTRADO elemento explícitamente marcado como principal:", 
+                  mainItemOnSubmit.type, file.name || "sin nombre");
+        mainMediaFile = file;
+        mainMediaType = mainItemOnSubmit.type;
+      }
+      
+      // Procesar cada elemento multimedia con verificación de seguridad mejorada
+      try {
+        if (data && data.mediaItems && Array.isArray(data.mediaItems)) {
+          data.mediaItems.forEach(item => {
+            if (item && typeof item === 'object' && item.file && 
+                item.deleted !== true && item.toDelete !== true) {
+              
+              // Verificar tipo de archivo con seguridad
+              if (item.type === 'photo' && item.file instanceof File) {
+                photos.push(item.file);
+              } else if (item.type === 'video' && item.file instanceof File) {
+                videos.push(item.file);
+              }
+              
+              // Añadimos verificación adicional y seguridad contra undefined
+              // solo si no hay un elemento principal ya definido
+              if (item.isMain === true && !mainMediaFile && 
+                  item.file instanceof File && typeof item.type === 'string') {
+                console.log("Asignando elemento principal durante procesamiento:", 
+                           item.type, item.file.name || "sin nombre");
+                mainMediaFile = item.file;
+                mainMediaType = item.type;
+              }
+            }
+          });
+        }
+      } catch (error) {
+        console.error("Error al procesar elementos multimedia:", error);
+      }
+      
+      // Actualizar campos anteriores para compatibilidad
+      form.setValue("eventPhotos", photos);
+      form.setValue("eventVideos", videos);
+      
+      // Establecer los campos individuales para compatibilidad
+      if (photos.length > 0) {
+        form.setValue("eventPhoto", photos[0]);
+      }
+      
+      if (videos.length > 0) {
+        form.setValue("eventVideo", videos[0]);
+      }
+      
+      // Mantener compatibilidad con los campos anteriores
+      if (data.eventPhoto) {
+        formData.append('eventPhoto', data.eventPhoto);
+        console.log("Añadido archivo de foto (método antiguo):", data.eventPhoto.name);
+      }
+      
+      if (data.eventVideo) {
+        formData.append('eventVideo', data.eventVideo);
+        console.log("Añadido archivo de video (método antiguo):", data.eventVideo.name);
+      }
+      
+      // Logs de depuración para ver qué contiene el FormData
+      console.log("FormData creado y listo para enviar");
+      const formFields: string[] = [];
+      formData.forEach((value, key) => {
+        if (value instanceof File) {
+          formFields.push(`${key}: File (${value.name}, ${value.size} bytes, ${value.type})`);
+        } else {
+          const valueStr = typeof value === 'string' ? 
+            (value.length > 50 ? value.substring(0, 50) + '...' : value) : 
+            String(value);
+          formFields.push(`${key}: ${valueStr}`);
+        }
+      });
+      console.log("Campos del formulario a enviar:", formFields);
+      
+      // Usar fetch directamente en lugar de apiRequest para FormData
+      const response = await fetch('/api/events', {
+        method: 'POST',
+        body: formData,
+        credentials: 'include' // Para enviar cookies de sesión
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error("Error del servidor:", errorData);
+        
+        // Check if this is a user authentication error
+        if (response.status === 401 || (errorData.code && errorData.code === 'USER_NOT_FOUND')) {
+          toast({
+            title: "Necesitas registrarte primero",
+            description: "Debes crear una cuenta y acceder antes de poder crear eventos.",
+            variant: "destructive",
+          });
+          // Redirect to auth page after a short delay
+          setTimeout(() => {
+            navigate("/auth");
+          }, 2000);
+          return;
+        }
+        
+        // Manejar errores específicos de carga de archivos
+        if (errorData.error === 'FILE_TOO_LARGE') {
+          toast({
+            title: "Archivo demasiado grande",
+            description: "El tamaño máximo permitido es 10MB para videos y 5MB para imágenes.",
+            variant: "destructive",
+          });
+          return;
+        }
+        
+        // Manejar otros errores de subida de archivos
+        if (errorData.error && errorData.error.startsWith('LIMIT_')) {
+          toast({
+            title: "Error al subir archivos",
+            description: errorData.message || "Verifica que tus archivos cumplan con los requisitos de tamaño y formato.",
+            variant: "destructive",
+          });
+          return;
+        }
+        
+        throw new Error(errorData.message || "Error al crear el evento");
+      }
+      
+      const createdEvent = await response.json();
+      console.log("Evento creado:", createdEvent);
+      
+      // Usar toast para notificar al usuario
+      toast({
+        title: "¡Éxito!",
+        description: "Tu evento ha sido creado correctamente",
+      });
+      
+      // Resetear el formulario ANTES de cerrar
+      form.reset({
+        title: "",
+        description: "",
+        category: "",
+        date: "",
+        time: "",
+        latitude: "",
+        longitude: "",
+        locationName: "",
+        locationAddress: "",
+        paymentType: "free",
+        price: "",
+        maxCapacity: "",
+        privacyType: "public",
+      });
+      
+      // Restablecer marcadores y otros estados
+      setMarkerPosition(defaultLocation);
+      setStep(1); // Volver al paso 1
+      
+      // Cerrar formulario sin recargar la página
+      onClose();
+      
+      // Actualizar los eventos sin recargar la página completa
+      // Usaremos react-query para invalidar la caché de eventos después de un breve retraso
+      setTimeout(() => {
+        // Importamos queryClient desde queryClient.ts 
+        import("@/lib/queryClient").then(({ queryClient }) => {
+          queryClient.invalidateQueries({ queryKey: ["/api/events"] });
+        });
+      }, 300);
+    } catch (error: any) {
+      console.error("Error creando evento:", error);
+      
+      // Prevenir mensajes de error "undefined" que confunden al usuario
+      const errorMessage = error && error.message ? 
+        error.message : 
+        "No se pudo crear el evento. Por favor, inténtalo de nuevo.";
+        
+      toast({
+        title: "Error al crear evento",
+        description: errorMessage !== "undefined" ? errorMessage : "Error al procesar la solicitud. Por favor, inténtalo de nuevo.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // Estados para transiciones y animaciones
+  const [fadeIn, setFadeIn] = useState(false);
+  const [stepAnimation, setStepAnimation] = useState<'fade-in' | 'fade-out' | 'none'>('none');
+  
+  // Efecto para controlar la animación de entrada/salida del formulario completo
+  useEffect(() => {
+    if (visible) {
+      // Primero montamos el componente, luego activamos la animación
+      setFadeIn(true);
+    } else {
+      // Al cerrar, primero quitamos la animación
+      setFadeIn(false);
+    }
+  }, [visible]);
+  
+  // Función para cambiar de paso con animación
+  const changeStep = useCallback((newStep: 1 | 2) => {
+    // Si estamos en el mismo paso, no hacemos nada
+    if (newStep === step) return;
+    
+    // Animación de salida
+    setStepAnimation('fade-out');
+    
+    // Después de la animación de salida, cambiamos el paso y hacemos animación de entrada
+    setTimeout(() => {
+      setStep(newStep);
+      setStepAnimation('fade-in');
+      
+      // Reset del estado de la animación después de completarla
+      setTimeout(() => {
+        setStepAnimation('none');
+      }, 300);
+    }, 300);
+  }, [step]);
+  
+  // Función simplificada para volver al paso anterior o cerrar formulario
+  const handleBackButtonClick = useCallback(() => {
+    try {
+      console.log("Botón de retroceso pulsado, paso actual:", step);
+      
+      // CAMBIO: Siempre cerrar el formulario sin importar el paso actual
+      // Esta opción es mejor que volver al paso 1 porque evita problemas de limpieza
+      console.log("Cerrando formulario de evento - llamando a onClose directamente");
+      
+      // Invocar onClose inmediatamente para que el componente padre lo desmonte completamente
+      onClose();
+    } catch (error) {
+      console.error("Error al manejar el botón de retroceso:", error);
+      
+      // En caso de error, igualmente intentar cerrar
+      onClose();
+    }
+  }, [onClose]);
+  
+  // Efecto para reiniciar el formulario cuando se hace visible
+  useEffect(() => {
+    if (visible) {
+      // Solo actualizar los campos de ubicación si hay una ubicación inicial
+      if (initialLocation) {
+        form.setValue("latitude", initialLocation.latitude);
+        form.setValue("longitude", initialLocation.longitude);
+        form.setValue("locationName", initialLocation.locationName);
+        form.setValue("locationAddress", initialLocation.locationAddress);
+      } else {
+        // Reiniciar todos los campos a sus valores predeterminados cuando se abre el formulario
+        form.reset({
+          title: "",
+          description: "",
+          category: "",
+          date: "",
+          time: "",
+          latitude: "",
+          longitude: "",
+          locationName: "",
+          locationAddress: "",
+          paymentType: "free",
+          price: "",
+          maxCapacity: "",
+          privacyType: "public",
+        });
+      }
+    }
+  }, [visible, initialLocation, form]);
+
+  // No renderizar nada si no es visible y la animación ha terminado
+  if (!visible && !fadeIn) return null;
+
+  // Renderizado condicional si Google Maps no ha cargado
+  if (!isLoaded) {
+    return (
+      <div className="absolute inset-0 bg-white z-30 flex items-center justify-center">
+        <div className="flex flex-col items-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mb-4"></div>
+          <p>Cargando mapa...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Error al cargar Google Maps
+  if (loadError) {
+    return (
+      <div className="absolute inset-0 bg-white z-30 flex items-center justify-center p-4">
+        <div className="bg-red-100 text-red-700 p-4 rounded-lg max-w-md">
+          <h3 className="font-bold mb-2">Error al cargar el mapa</h3>
+          <p>No se pudo cargar Google Maps. Por favor intenta recargar la página.</p>
+          <button 
+            className="mt-4 px-4 py-2 bg-primary text-white rounded-lg"
+            onClick={onClose}
+          >
+            Cerrar
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // COMPONENTE DE RENDERIZADO
+  return (
+    <div className={`absolute inset-0 bg-white z-30 transition-opacity duration-300 ${fadeIn ? 'opacity-100' : 'opacity-0'}`}>
+      <div className="flex flex-col h-full">
+        {/* Cabecera */}
+        <div className="px-4 py-3 border-b border-neutral-200 flex items-center justify-between">
+          <button className="p-2" onClick={handleBackButtonClick}>
+            <ArrowLeft size={24} />
+          </button>
+          <h2 className="font-semibold text-lg">Crear Evento</h2>
+          <div className="w-10"></div>
+        </div>
+        
+        {/* Formulario */}
+        <Form {...form}>
+          <form onSubmit={form.handleSubmit(onSubmit)} className="flex-1 overflow-auto">
+            {/* PASO 1: Selección de ubicación */}
+            {step === 1 && (
+              <div className={`flex-1 overflow-auto transition-opacity duration-300 ${
+                stepAnimation === 'fade-in' ? 'opacity-100' : 
+                stepAnimation === 'fade-out' ? 'opacity-0' : 
+                'opacity-100'
+              }`}>
+                <div className="p-4">
+                  <h3 className="font-medium mb-2">Selecciona la Ubicación del Evento</h3>
+                  <p className="text-neutral-500 mb-4">Toca el mapa para seleccionar dónde se realizará tu evento.</p>
+                </div>
+                
+                {/* Mapa para selección de ubicación */}
+                <div className="h-96 bg-neutral-100 relative overflow-hidden">
+                  <GoogleMap
+                    mapContainerStyle={{ height: '100%', width: '100%' }}
+                    center={center}
+                    zoom={11}
+                    onClick={handleMapClick}
+                    onLoad={onMapLoad}
+                    options={{
+                      disableDefaultUI: false,
+                      zoomControl: true,
+                      mapTypeControl: false,
+                      streetViewControl: false,
+                      fullscreenControl: true,
+                    }}
+                  >
+                    {/* Marcador en la ubicación seleccionada */}
+                    {markerPosition.lat && markerPosition.lng && (
+                      <Marker 
+                        position={markerPosition}
+                        draggable={true}
+                        onDragEnd={(e) => {
+                          if (e.latLng) {
+                            handleMapClick(e as google.maps.MapMouseEvent);
+                          }
+                        }}
+                      />
+                    )}
+                  </GoogleMap>
+                </div>
+                
+                <div className="p-4">
+                  <Button 
+                    type="button"
+                    className="w-full py-3 bg-primary text-white font-semibold rounded-xl mt-4"
+                    onClick={validateAndContinue}
+                  >
+                    Continuar
+                  </Button>
+                </div>
+              </div>
+            )}
+            
+            {/* PASO 2: Formulario de detalles del evento */}
+            {step === 2 && (
+              <div className={`flex-1 overflow-auto transition-opacity duration-300 ${
+                stepAnimation === 'fade-in' ? 'opacity-100' : 
+                stepAnimation === 'fade-out' ? 'opacity-0' : 
+                'opacity-100'
+              }`}>
+                {/* Mapa pequeño con ubicación seleccionada */}
+                <div className="h-60 bg-neutral-100 relative overflow-hidden">
+                  <GoogleMap
+                    mapContainerStyle={{ height: '100%', width: '100%' }}
+                    center={(() => {
+                      // Obtener y verificar las coordenadas antes de utilizarlas
+                      const latValue = form.getValues("latitude");
+                      const lngValue = form.getValues("longitude");
+                      
+                      // Debugging
+                      console.log("Valores para centrar el mapa:", { latValue, lngValue, 
+                        tipoLat: typeof latValue, tipoLng: typeof lngValue 
+                      });
+                      
+                      // Verificar que sean valores numéricos válidos
+                      const lat = Number(latValue);
+                      const lng = Number(lngValue);
+                      
+                      // Solo devolver las coordenadas si son números válidos
+                      if (!isNaN(lat) && !isNaN(lng)) {
+                        console.log("Usando coordenadas válidas:", { lat, lng });
+                        return { lat, lng };
+                      }
+                      
+                      // Valor predeterminado para Córdoba, Argentina si las coordenadas no son válidas
+                      console.log("Usando coordenadas predeterminadas para Córdoba");
+                      return { lat: -31.4201, lng: -64.1888 };
+                    })()}
+                    zoom={14}
+                    options={{
+                      disableDefaultUI: true,
+                      zoomControl: true,
+                    }}
+                  >
+                    {(() => {
+                      // Obtener y verificar las coordenadas antes de mostrar el marcador
+                      const latValue = form.getValues("latitude");
+                      const lngValue = form.getValues("longitude");
+                      
+                      // Verificar que sean valores numéricos válidos
+                      const lat = Number(latValue);
+                      const lng = Number(lngValue);
+                      
+                      // Solo mostrar el marcador si las coordenadas son válidas
+                      if (!isNaN(lat) && !isNaN(lng)) {
+                        return (
+                          <Marker 
+                            position={{ lat, lng }}
+                          />
+                        );
+                      }
+                      
+                      // No mostrar marcador si las coordenadas no son válidas
+                      return null;
+                    })()}
+                  </GoogleMap>
+                </div>
+                
+                <div className="p-4">
+                  {/* Información de ubicación */}
+                  <div className="mb-4 border border-neutral-200 p-3 rounded-xl bg-neutral-50">
+                    <div className="flex items-center gap-2">
+                      <MapIcon className="h-5 w-5 text-primary" />
+                      <FormLabel className="font-medium">Ubicación</FormLabel>
+                    </div>
+                    <div className="mt-2">
+                      <p className="text-sm font-medium">{form.getValues("locationName") || "Ubicación seleccionada"}</p>
+                      <p className="text-sm text-gray-600">{form.getValues("locationAddress") || "Dirección detectada del mapa"}</p>
+                    </div>
+                    
+                    {/* Campos ocultos para datos de ubicación */}
+                    <input type="hidden" {...form.register("locationAddress")} />
+                    <input type="hidden" {...form.register("locationName")} />
+                    <input type="hidden" {...form.register("latitude")} />
+                    <input type="hidden" {...form.register("longitude")} />
+                  </div>
+                
+                  {/* Título del evento */}
+                  <FormField
+                    control={form.control}
+                    name="title"
+                    render={({ field }) => (
+                      <FormItem className="mb-4">
+                        <FormLabel>Nombre del Evento</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            placeholder="Dale un nombre a tu evento"
+                            className="w-full p-3 border border-neutral-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary"
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  
+                  {/* Categoría del evento */}
+                  <FormField
+                    control={form.control}
+                    name="category"
+                    render={({ field }) => (
+                      <FormItem className="mb-4">
+                        <FormLabel>Categoría</FormLabel>
+                        <Select 
+                          onValueChange={field.onChange} 
+                          defaultValue={field.value}
+                        >
+                          <FormControl>
+                            <SelectTrigger className="w-full p-3 border border-neutral-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary">
+                              <SelectValue placeholder="Selecciona una categoría" />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            {EVENT_CATEGORIES.map(category => (
+                              <SelectItem key={category.value} value={category.value}>
+                                {category.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  
+                  {/* Fecha y hora */}
+                  <div className="mb-4">
+                    <FormLabel>Fecha y Hora</FormLabel>
+                    <div className="flex gap-2">
+                      <FormField
+                        control={form.control}
+                        name="date"
+                        render={({ field }) => (
+                          <FormItem className="flex-1">
+                            <FormControl>
+                              <Input
+                                {...field}
+                                type="date"
+                                className="w-full p-3 border border-neutral-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary"
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      
+                      <FormField
+                        control={form.control}
+                        name="time"
+                        render={({ field }) => (
+                          <FormItem className="flex-1">
+                            <FormControl>
+                              <Input
+                                {...field}
+                                type="time"
+                                className="w-full p-3 border border-neutral-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary"
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    </div>
+                  </div>
+                  
+                  {/* Descripción */}
+                  <FormField
+                    control={form.control}
+                    name="description"
+                    render={({ field }) => (
+                      <FormItem className="mb-4">
+                        <FormLabel>Descripción</FormLabel>
+                        <FormControl>
+                          <Textarea
+                            {...field}
+                            placeholder="Cuéntale a la gente sobre tu evento..."
+                            className="w-full p-3 border border-neutral-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary h-28"
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  
+                  {/* Tipo de pago - Siempre establecido a "free" */}
+                  <input type="hidden" {...form.register("paymentType")} value="free" />
+                  
+                  {/* Capacidad máxima */}
+                  <FormField
+                    control={form.control}
+                    name="maxCapacity"
+                    render={({ field }) => (
+                      <FormItem className="mb-4">
+                        <FormLabel>Capacidad Máxima (Opcional)</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            type="number"
+                            min="1"
+                            placeholder="Sin límite"
+                            className="w-full p-3 border border-neutral-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary"
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  
+                  {/* Tipo de privacidad */}
+                  <FormField
+                    control={form.control}
+                    name="privacyType"
+                    render={({ field }) => (
+                      <FormItem className="mb-4">
+                        <FormLabel>Privacidad</FormLabel>
+                        <div className="flex gap-2">
+                          <Button
+                            type="button"
+                            className={`flex-1 py-2 ${field.value === 'public' ? 'bg-primary text-white' : 'bg-white text-neutral-700 border border-neutral-300'}`}
+                            onClick={() => form.setValue("privacyType", "public")}
+                          >
+                            Público
+                          </Button>
+                          <Button
+                            type="button"
+                            className={`flex-1 py-2 ${field.value === 'private' ? 'bg-primary text-white' : 'bg-white text-neutral-700 border border-neutral-300'}`}
+                            onClick={() => form.setValue("privacyType", "private")}
+                          >
+                            Privado
+                          </Button>
+                        </div>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  
+                  {/* Selector de tipo de acceso privado - Solo visible cuando el evento es privado */}
+                  {form.watch("privacyType") === "private" && (
+                    <FormField
+                      control={form.control}
+                      name="privateAccessType"
+                      render={({ field }) => (
+                        <FormItem className="mb-4">
+                          <FormLabel>Tipo de acceso para evento privado</FormLabel>
+                          <div className="grid grid-cols-1 gap-2 mb-2">
+                            <Button
+                              type="button"
+                              className={`py-2 ${field.value === 'solicitud' ? 'bg-primary text-white' : 'bg-white text-neutral-700 border border-neutral-300'}`}
+                              onClick={() => form.setValue("privateAccessType", "solicitud")}
+                            >
+                              Por solicitud - Los participantes piden unirse y tú apruebas
+                            </Button>
+                            <Button
+                              type="button"
+                              className={`py-2 ${field.value === 'postulacion' ? 'bg-primary text-white' : 'bg-white text-neutral-700 border border-neutral-300'}`}
+                              onClick={() => form.setValue("privateAccessType", "postulacion")}
+                            >
+                              Por postulación - Los participantes contestan preguntas
+                            </Button>
+                            <Button
+                              type="button"
+                              className={`py-2 ${field.value === 'paga' ? 'bg-primary text-white' : 'bg-white text-neutral-700 border border-neutral-300'}`}
+                              onClick={() => form.setValue("privateAccessType", "paga")}
+                              disabled={true} // Deshabilitamos temporalmente la opción de pago
+                            >
+                              Por pago - Los participantes pagan para unirse (próximamente)
+                            </Button>
+                          </div>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  )}
+                  
+                  {/* Preguntas para aplicantes - Solo visible cuando es tipo de postulación */}
+                  {form.watch("privacyType") === "private" && form.watch("privateAccessType") === "postulacion" && (
+                    <FormField
+                      control={form.control}
+                      name="applicationQuestions"
+                      render={({ field }) => (
+                        <FormItem className="mb-4">
+                          <FormLabel>Preguntas para los solicitantes</FormLabel>
+                          <FormControl>
+                            <Textarea
+                              placeholder="Escribe aquí las preguntas para los solicitantes, separadas por líneas."
+                              className="h-24"
+                              {...field}
+                            />
+                          </FormControl>
+                          <p className="text-xs text-muted-foreground mt-1">
+                            Separa cada pregunta con un salto de línea. Ejemplo: "¿Por qué quieres asistir a este evento?" y en la siguiente línea "¿Qué esperas obtener del evento?"
+                          </p>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  )}
+                  
+                  {/* Gestor de multimedia unificado */}
+                  <div className="mt-6 space-y-4">
+                    <FormField
+                      control={form.control}
+                      name="mediaItems"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormControl>
+                            <MediaManager
+                              existingMedia={field.value || []}
+                              onChange={(mediaItems) => {
+                                // Verificar que mediaItems exista antes de procesarlo
+                                if (!mediaItems) {
+                                  console.warn("MediaManager devolvió mediaItems undefined o null");
+                                  field.onChange([]);
+                                  return;
+                                }
+                                // CAMBIO CRÍTICO: Crear una copia profunda para evitar problemas de referencia
+                                const safeMediaItems = JSON.parse(JSON.stringify(mediaItems));
+                                
+                                // Verificar si hay un elemento marcado como principal
+                                const hasMainMedia = safeMediaItems.some(item => 
+                                  item.isMain === true && !item.deleted && !item.toDelete
+                                );
+                                
+                                console.log("=== PROCESANDO onChange EN MEDIA MANAGER ===");
+                                console.log("¿Hay elemento principal explícito?", hasMainMedia);
+                                
+                                // Si no hay un elemento principal, seleccionar uno automáticamente
+                                if (!hasMainMedia && safeMediaItems.length > 0) {
+                                  // Filtrar elementos válidos
+                                  const validItems = safeMediaItems.filter(item => 
+                                    !item.deleted && !item.toDelete
+                                  );
+                                  
+                                  if (validItems.length > 0) {
+                                    // Priorizar fotos sobre videos
+                                    const firstPhoto = validItems.find(item => item.type === 'photo');
+                                    const itemToSetMain = firstPhoto || validItems[0];
+                                    
+                                    // Asegurarse de que SOLO UN elemento sea principal
+                                    safeMediaItems.forEach(item => {
+                                      item.isMain = false; // Resetear todos primero
+                                    });
+                                    
+                                    // Encontrar el elemento por referencias equivalentes
+                                    const indexToSetMain = safeMediaItems.findIndex(item => 
+                                      (item.id && itemToSetMain.id && item.id === itemToSetMain.id) || 
+                                      (item.file && itemToSetMain.file && 
+                                       item.file.name === itemToSetMain.file.name)
+                                    );
+                                    
+                                    if (indexToSetMain >= 0) {
+                                      safeMediaItems[indexToSetMain].isMain = true;
+                                      console.log("Elemento principal seleccionado automáticamente:", {
+                                        index: indexToSetMain,
+                                        tipo: safeMediaItems[indexToSetMain].type,
+                                        nombre: safeMediaItems[indexToSetMain].file ? 
+                                          safeMediaItems[indexToSetMain].file.name : 'sin archivo'
+                                      });
+                                    }
+                                  }
+                                }
+                                
+                                // Actualizar el campo con los valores procesados
+                                field.onChange(safeMediaItems);
+                                
+                                // COMPATIBILIDAD: Procesar para formulario legacy
+                                const photos: File[] = [];
+                                const videos: File[] = [];
+                                let mainMediaFile: File | null = null;
+                                let mainMediaType: string | null = null;
+                                
+                                // Encontrar elemento principal para campos legacy
+                                const mainItem = safeMediaItems && safeMediaItems.length > 0 ? 
+                                  safeMediaItems.find(item => 
+                                    item && item.isMain === true && !item.deleted && !item.toDelete
+                                  ) : null;
+                                
+                                console.log("ELEMENTO PRINCIPAL FINAL:", mainItem && mainItem.type ? {
+                                  tipo: mainItem.type,
+                                  nombre: mainItem.file ? mainItem.file.name : (mainItem.url || 'sin archivo')
+                                } : 'NINGUNO');
+                                
+                                // Organizar archivos por tipo
+                                if (safeMediaItems && Array.isArray(safeMediaItems)) {
+                                  safeMediaItems.forEach(item => {
+                                    if (item && item.file && !item.deleted && !item.toDelete) {
+                                      if (item.type === 'photo') {
+                                        photos.push(item.file);
+                                      } else if (item.type === 'video') {
+                                        videos.push(item.file);
+                                      }
+                                    }
+                                  });
+                                }
+                                
+                                // Actualizar campos legacy
+                                form.setValue("eventPhotos", photos);
+                                form.setValue("eventVideos", videos);
+                                
+                                // Procesamiento de media principal con protección avanzada contra nulos
+                                if (mainItem && mainItem.file && mainItem.type) {
+                                  console.log(`Configurando campos legacy con archivo principal: ${mainItem.type}`, 
+                                           mainItem.file.name);
+                                  
+                                  // Establecer mainMediaFile y mainMediaType directamente
+                                  form.setValue("mainMediaFile", mainItem.file);
+                                  form.setValue("mainMediaType", mainItem.type);
+                                  
+                                  // Actualizar también campos de eventPhoto/eventVideo por compatibilidad
+                                  if (mainItem.type === 'photo') {
+                                    form.setValue("eventPhoto", mainItem.file);
+                                  } else if (mainItem.type === 'video') {
+                                    form.setValue("eventVideo", mainItem.file);
+                                  }
+                                } else {
+                                  // Si no hay elemento principal, primero limpiar los campos
+                                  form.setValue("mainMediaFile", undefined);
+                                  form.setValue("mainMediaType", undefined);
+                                  form.setValue("eventPhoto", undefined);
+                                  form.setValue("eventVideo", undefined);
+                                  
+                                  // Luego intentar usar el primer archivo disponible como fallback
+                                  if (photos.length > 0) {
+                                    form.setValue("eventPhoto", photos[0]);
+                                    form.setValue("mainMediaFile", photos[0]);
+                                    form.setValue("mainMediaType", "photo");
+                                  } else if (videos.length > 0) {
+                                    form.setValue("eventVideo", videos[0]);
+                                    form.setValue("mainMediaFile", videos[0]);
+                                    form.setValue("mainMediaType", "video");
+                                  }
+                                }
+                                
+                                console.log("=== FIN PROCESAMIENTO onChange ===");
+                              }}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+
+                  <div className="mb-20 mt-6">
+                    <Button 
+                      type="submit" 
+                      className="w-full py-3 bg-primary text-white font-semibold rounded-xl"
+                      disabled={isSubmitting}
+                    >
+                      {isSubmitting ? (
+                        <div className="flex items-center justify-center">
+                          <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2"></div>
+                          Creando...
+                        </div>
+                      ) : "Crear Evento"}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </form>
+        </Form>
+      </div>
+    </div>
+  );
+};
+
+export default CreateEventFormGoogle;

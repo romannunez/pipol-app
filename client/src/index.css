@@ -1,0 +1,627 @@
+/* Mapbox GL CSS */
+@import "mapbox-gl/dist/mapbox-gl.css";
+
+/* Ocultar TODOS los controles de Mapbox completamente */
+.mapboxgl-ctrl-group,
+.mapboxgl-ctrl-top-right,
+.mapboxgl-ctrl-bottom-right,
+.mapboxgl-ctrl-bottom-left,
+.mapboxgl-ctrl-top-left,
+.mapboxgl-ctrl {
+  display: none !important;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* No eliminamos los selectores nativos de fecha y hora para mantener la funcionalidad */
+
+/* Estilos personalizados para solucionar problemas de scroll en formularios */
+.edit-event-container {
+  height: auto;
+  max-height: calc(90vh - 100px);
+  overflow-y: auto !important;
+  padding-bottom: 120px;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+
+/* Estilos específicos para el contenedor de edición en el panel */
+.event-edit-container {
+  overflow-y: auto !important;
+  height: auto;
+  min-height: 100%;
+  max-height: none;
+  padding-bottom: 150px;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Animaciones para el panel deslizante */
+.slide-up {
+  animation: slideUpAnimation 0.3s ease-out forwards;
+}
+
+.slide-down {
+  animation: slideDownAnimation 0.3s ease-out forwards;
+}
+
+@keyframes slideUpAnimation {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes slideDownAnimation {
+  from {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+}
+
+/* Animaciones para las tarjetas de chat que se despliegan hacia arriba */
+@keyframes slideUpCard {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+    scale: 0.95;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+    scale: 1;
+  }
+}
+
+/* Hide scrollbar while maintaining scrollability */
+.scrollbar-hide {
+  -ms-overflow-style: none;  /* Internet Explorer 10+ */
+  scrollbar-width: none;  /* Firefox */
+}
+
+.scrollbar-hide::-webkit-scrollbar { 
+  display: none;  /* Safari and Chrome */
+}
+
+/* Custom slider styles for the distance filter */
+[data-radix-slider-root] {
+  position: relative;
+  display: flex;
+  align-items: center;
+  user-select: none;
+  touch-action: none;
+  width: 100%;
+  height: 20px;
+}
+
+[data-radix-slider-track] {
+  background-color: rgba(255, 255, 255, 0.2);
+  position: relative;
+  flex-grow: 1;
+  border-radius: 9999px;
+  height: 3px;
+}
+
+[data-radix-slider-range] {
+  position: absolute;
+  background-color: rgba(255, 255, 255, 0.8);
+  border-radius: 9999px;
+  height: 100%;
+}
+
+[data-radix-slider-thumb] {
+  display: block;
+  width: 20px;
+  height: 20px;
+  background-color: white;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+  border-radius: 10px;
+  border: 2px solid rgba(255, 255, 255, 0.9);
+  cursor: grab;
+  transition: all 0.2s ease;
+}
+
+[data-radix-slider-thumb]:hover {
+  transform: scale(1.1);
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.6);
+}
+
+[data-radix-slider-thumb]:focus {
+  outline: none;
+  box-shadow: 0 0 0 5px rgba(255, 255, 255, 0.3);
+}
+
+[data-radix-slider-thumb]:active {
+  cursor: grabbing;
+  transform: scale(1.05);
+}
+
+.animate-slide-up-card {
+  animation: slideUpCard 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+
+/* Mejoras visuales para las tarjetas de chat */
+.chat-card-shadow {
+  box-shadow: 
+    0 10px 25px rgba(0, 0, 0, 0.1),
+    0 5px 10px rgba(0, 0, 0, 0.05),
+    0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.chat-card-shadow-blue {
+  box-shadow: 
+    0 10px 25px rgba(59, 130, 246, 0.3),
+    0 5px 10px rgba(59, 130, 246, 0.2),
+    0 1px 3px rgba(59, 130, 246, 0.1);
+}
+
+/* Estilos para formularios en vistas de edición */
+.edit-form-myevents {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  padding-bottom: 120px;
+  overflow-y: auto;
+}
+
+/* Estilos para campos de solo lectura */
+.readonly-field {
+  background-color: #f3f4f6;
+  padding: 8px 12px;
+  border-radius: 6px;
+  color: #4b5563;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
+/* Pulsating circle animation for map marker */
+.pulsating-circle {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background-color: #FF5A5F;
+  box-shadow: 0 0 0 rgba(255, 90, 95, 0.4);
+  animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 90, 95, 0.4);
+  }
+  70% {
+    box-shadow: 0 0 0 20px rgba(255, 90, 95, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 90, 95, 0);
+  }
+}
+
+/* Autocomplete dropdown styles */
+.mapboxgl-ctrl-geocoder {
+  width: 100% !important;
+  max-width: 100% !important;
+  font-family: inherit !important;
+  border-radius: 0.75rem !important;
+  box-shadow: none !important;
+  border: 1px solid #e5e7eb !important;
+}
+
+.mapboxgl-ctrl-geocoder--input {
+  height: 50px !important;
+  padding: 0.75rem 1rem !important;
+  font-size: 1rem !important;
+}
+
+.mapboxgl-ctrl-geocoder--suggestion {
+  padding: 0.75rem 1rem !important;
+  font-size: 0.875rem !important;
+}
+
+.mapboxgl-ctrl-geocoder--suggestion-title {
+  font-weight: 600 !important;
+}
+
+.mapboxgl-ctrl-geocoder--suggestion-address {
+  color: #6b7280 !important;
+}
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 0 0% 0%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 0%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 0%;
+
+    --primary: 49 100% 50%;
+    --primary-foreground: 0 0% 0%;
+
+    --primary-dark: 49 100% 45%;
+    --primary-light: 49 100% 96%;
+
+    --secondary: 0 0% 9%;
+    --secondary-foreground: 0 0% 100%;
+
+    --muted: 0 0% 96.1%;
+    --muted-foreground: 0 0% 45.9%;
+
+    --accent: 49 100% 50%;
+    --accent-foreground: 0 0% 0%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 0 0% 89.8%;
+    --input: 0 0% 89.8%;
+    --ring: 49 100% 50%;
+
+    --radius: 0.75rem;
+  }
+
+  .dark {
+    --background: 0 0% 3.9%;
+    --foreground: 0 0% 98%;
+
+    --card: 0 0% 3.9%;
+    --card-foreground: 0 0% 98%;
+
+    --popover: 0 0% 3.9%;
+    --popover-foreground: 0 0% 98%;
+
+    --primary: 49 100% 50%;
+    --primary-foreground: 0 0% 0%;
+
+    --primary-dark: 49 100% 45%;
+    --primary-light: 49 100% 96%;
+
+    --secondary: 0 0% 14.9%;
+    --secondary-foreground: 0 0% 98%;
+
+    --muted: 0 0% 14.9%;
+    --muted-foreground: 0 0% 63.9%;
+
+    --accent: 49 100% 50%;
+    --accent-foreground: 0 0% 0%;
+
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 0 0% 14.9%;
+    --input: 0 0% 14.9%;
+    --ring: 49 100% 50%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior-y: none;
+  }
+}
+
+.map-container, 
+.mapboxgl-map,
+.mapboxgl-canvas-container,
+.mapboxgl-canvas {
+  height: 100% !important;
+  width: 100% !important;
+}
+
+.pin-bounce {
+  animation: bounce 0.6s ease-in-out;
+}
+
+@keyframes bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+
+/* Esta sección se eliminó para evitar duplicación con la definición anterior */
+
+.category-social { @apply bg-[#4361EE] text-white; }
+.category-music { @apply bg-[#8338EC] text-white; }
+.category-spiritual { @apply bg-[#9E8FB2] text-white; }
+.category-education { @apply bg-[#F94144] text-white; }
+.category-sports { @apply bg-[#3A86FF] text-white; }
+.category-food { @apply bg-[#FB8500] text-white; }
+.category-art { @apply bg-[#F15BB5] text-white; }
+.category-technology { @apply bg-[#06D6A0] text-white; }
+.category-games { @apply bg-[#EB2F96] text-white; }
+.category-outdoor { @apply bg-[#9254DE] text-white; }
+.category-networking { @apply bg-[#FA541C] text-white; }
+.category-workshop { @apply bg-[#FAAD14] text-white; }
+.category-conference { @apply bg-[#595959] text-white; }
+.category-party { @apply bg-[#F5222D] text-white; }
+.category-fair { @apply bg-[#FA8C16] text-white; }
+.category-exhibition { @apply bg-[#722ED1] text-white; }
+
+.category-social-light { @apply bg-[#4361EE]/10 text-[#4361EE]; }
+.category-music-light { @apply bg-[#8338EC]/10 text-[#8338EC]; }
+.category-spiritual-light { @apply bg-[#9E8FB2]/10 text-[#9E8FB2]; }
+.category-education-light { @apply bg-[#F94144]/10 text-[#F94144]; }
+.category-sports-light { @apply bg-[#3A86FF]/10 text-[#3A86FF]; }
+.category-food-light { @apply bg-[#FB8500]/10 text-[#FB8500]; }
+.category-art-light { @apply bg-[#F15BB5]/10 text-[#F15BB5]; }
+.category-technology-light { @apply bg-[#06D6A0]/10 text-[#06D6A0]; }
+.category-games-light { @apply bg-[#EB2F96]/10 text-[#EB2F96]; }
+.category-outdoor-light { @apply bg-[#9254DE]/10 text-[#9254DE]; }
+.category-networking-light { @apply bg-[#FA541C]/10 text-[#FA541C]; }
+.category-workshop-light { @apply bg-[#FAAD14]/10 text-[#FAAD14]; }
+.category-conference-light { @apply bg-[#595959]/10 text-[#595959]; }
+.category-party-light { @apply bg-[#F5222D]/10 text-[#F5222D]; }
+.category-fair-light { @apply bg-[#FA8C16]/10 text-[#FA8C16]; }
+.category-exhibition-light { @apply bg-[#722ED1]/10 text-[#722ED1]; }
+
+.shadow-card {
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+}
+
+.shadow-bottom {
+  box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.05);
+}
+
+.shadow-panel {
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.1);
+  border-top-left-radius: 1.5rem;
+  border-top-right-radius: 1.5rem;
+  overflow: hidden;
+}
+
+/* Better scrolling for event detail cards */
+.shadow-panel .flex-1::-webkit-scrollbar {
+  width: 6px;
+}
+
+.shadow-panel .flex-1::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: 10px;
+}
+
+.shadow-panel .flex-1::-webkit-scrollbar-thumb {
+  background: #d1d5db;
+  border-radius: 10px;
+}
+
+.shadow-panel .flex-1::-webkit-scrollbar-thumb:hover {
+  background: #9ca3af;
+}
+
+/* Ensure smooth scrolling on mobile */
+.shadow-panel .flex-1 {
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: #d1d5db transparent;
+}
+
+/* Mapbox Marker Styles */
+.event-marker {
+  width: 42px; /* Más grande para mejor visibilidad */
+  height: 42px;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  border: 2px solid white;
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.35);
+  font-size: 16px; /* Texto más grande */
+  font-weight: bold;
+  color: white;
+  transition: transform 0.2s, box-shadow 0.2s;
+  z-index: 1;
+}
+
+.event-marker:hover {
+  transform: scale(1.15);
+  box-shadow: 0 5px 15px rgba(0, 0, 0, 0.5);
+  z-index: 2;
+}
+
+.event-marker.social { background-color: #4361EE; }
+.event-marker.music { background-color: #8338EC; }
+.event-marker.spiritual { background-color: #9E8FB2; }
+.event-marker.education { background-color: #F94144; }
+.event-marker.sports { background-color: #3A86FF; }
+.event-marker.food { background-color: #FB8500; }
+.event-marker.art { background-color: #F15BB5; }
+.event-marker.technology { background-color: #06D6A0; }
+.event-marker.games { background-color: #EB2F96; }
+.event-marker.outdoor { background-color: #9254DE; }
+.event-marker.networking { background-color: #FA541C; }
+.event-marker.workshop { background-color: #FAAD14; }
+.event-marker.conference { background-color: #595959; }
+.event-marker.party { background-color: #F5222D; }
+.event-marker.fair { background-color: #FA8C16; }
+.event-marker.exhibition { background-color: #722ED1; }
+
+/* Mapbox Popup Styles - Nuevo diseño */
+.mapboxgl-popup-content {
+  padding: 12px;
+  border-radius: 12px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  border: none;
+}
+
+.mapboxgl-popup-close-button {
+  color: #666;
+  font-size: 18px;
+  padding: 4px;
+  line-height: 1;
+  right: 6px;
+  top: 6px;
+  transition: color 0.2s;
+}
+
+.mapboxgl-popup-close-button:hover {
+  color: #333;
+  background: none;
+}
+
+/* Estilos específicos para los nuevos popups de eventos */
+.event-popup .mapboxgl-popup-content {
+  padding: 12px;
+  border-radius: 12px;
+  background-color: white;
+  border: none;
+  overflow: hidden;
+}
+
+.event-popup .mapboxgl-popup-tip {
+  border-top-color: white;
+}
+
+.popup-content {
+  min-width: 180px;
+  max-width: 240px;
+}
+
+.event-popup-category {
+  font-size: 11px;
+  font-weight: bold;
+  text-transform: uppercase;
+  color: #9254DE;
+  margin-bottom: 4px;
+  letter-spacing: 0.5px;
+}
+
+.event-popup-image {
+  height: 100px;
+  width: 100%;
+  border-radius: 8px;
+  margin-bottom: 10px;
+  background-size: cover;
+  background-position: center;
+  overflow: hidden;
+}
+
+.event-popup-image-placeholder {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-size: 36px;
+  font-weight: bold;
+}
+
+.event-popup-button {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  margin-top: 10px;
+  background-color: #3B82F6;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: bold;
+  font-size: 14px;
+  transition: all 0.2s ease;
+}
+
+.event-popup-button:hover {
+  background-color: #2563EB;
+  transform: translateY(-2px);
+}
+
+.event-popup-title {
+  font-size: 16px;
+  font-weight: bold;
+  margin: 0 0 8px 0;
+  line-height: 1.3;
+  color: #000;
+}
+
+.event-popup-details {
+  margin-bottom: 8px;
+}
+
+.event-popup-date-time,
+.event-popup-location {
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  margin-bottom: 4px;
+  color: #555;
+}
+
+.event-popup-icon {
+  margin-right: 5px;
+  font-size: 11px;
+}
+
+.event-popup-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.event-popup-attendees {
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  color: #555;
+}
+
+.event-popup-payment-type {
+  padding: 3px 8px;
+  border-radius: 30px;
+  font-size: 11px;
+  font-weight: bold;
+}
+
+.event-popup-payment-type.free {
+  background-color: #FFEDD5;
+  color: #fff700;
+}
+
+.event-popup-payment-type.paid {
+  background-color: #EFF6FF;
+  color: #3B82F6;
+}
+
+/* Estilo para el botón en el popup */
+.popup-content button {
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.popup-content button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+
+.marker-shadow {
+  position: absolute;
+  bottom: -4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 20px;
+  height: 4px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 50%;
+  filter: blur(2px);
+}
+
+.custom-marker-container {
+  transform: translate(-50%, -100%);
+}
+
+/* Las animaciones de panel se definieron anteriormente, eliminando esta duplicación */

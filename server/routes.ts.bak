@@ -1,0 +1,2460 @@
+import express, { Express, Request, Response } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { loginUserSchema, insertUserSchema, insertEventSchema, insertEventAttendeeSchema } from "@shared/schema";
+import { z } from "zod";
+import Stripe from "stripe";
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+import { processUploadedMedia, preserveExistingMedia } from "./media-helper";
+import { isAuthenticated } from "./auth";
+import { authRoutes } from "./auth-routes";
+import { supabase } from "./supabase-client";
+import { setupRealtimeWS } from './supabase-realtime';
+
+// Payment functionality is disabled for this app
+console.log("Payment functionality is disabled in this version of the app.");
+
+// Set stripe to null - all events will be free
+const stripe = null;
+
+// Configurar almacenamiento para multer
+const storage_uploads = multer.diskStorage({
+  destination: function (req, file, cb) {
+    // Definir el directorio según el tipo de archivo
+    let uploadPath = 'public/uploads/events';
+    
+    // Asegurarse de que el directorio existe
+    if (!fs.existsSync(uploadPath)) {
+      fs.mkdirSync(uploadPath, { recursive: true });
+    }
+    
+    cb(null, uploadPath);
+  },
+  filename: function (req, file, cb) {
+    // Generar un nombre de archivo único
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const extension = path.extname(file.originalname);
+    cb(null, 'event-' + uniqueSuffix + extension);
+  }
+});
+
+// Filtrar archivos por tipo y validar condiciones
+const fileFilter = (req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+  console.log(`Procesando archivo: ${file.fieldname}, tipo: ${file.mimetype}`);
+  
+  // Categorizar el archivo según el campo
+  const isImageField = file.fieldname === 'eventPhoto' || file.fieldname === 'photos' || file.fieldname.startsWith('photos[');
+  const isVideoField = file.fieldname === 'eventVideo' || file.fieldname === 'videos' || file.fieldname.startsWith('videos[');
+  const isMainMediaField = file.fieldname === 'mainMediaFile' || file.fieldname === 'mainMedia';
+  const isMediaManagerField = file.fieldname.startsWith('mediaFile_');
+  
+  // Verificar tipo de contenido
+  const isImage = file.mimetype.startsWith('image/');
+  const isVideo = file.mimetype.startsWith('video/');
+  
+  // Validar según tipo de campo
+  if (isImageField) {
+    if (!isImage) {
+      console.warn(`Archivo rechazado - tipo incorrecto: ${file.fieldname}, ${file.mimetype}`);
+      return cb(new Error(`El archivo debe ser una imagen. Tipo recibido: ${file.mimetype}`));
+    }
+    
+    console.log(`Imagen aceptada: ${file.originalname}`);
+    return cb(null, true);
+  } 
+  else if (isVideoField) {
+    if (!isVideo) {
+      console.warn(`Archivo rechazado - tipo incorrecto: ${file.fieldname}, ${file.mimetype}`);
+      return cb(new Error(`El archivo debe ser un video. Tipo recibido: ${file.mimetype}`));
+    }
+    
+    console.log(`Video aceptado: ${file.originalname}`);
+    return cb(null, true);
+  }
+  else if (isMainMediaField || isMediaManagerField) {
+    // Permitir tanto imágenes como videos para estos campos
+    if (!isImage && !isVideo) {
+      console.warn(`Archivo rechazado - tipo incorrecto: ${file.fieldname}, ${file.mimetype}`);
+      return cb(new Error(`El archivo multimedia debe ser una imagen o un video. Tipo recibido: ${file.mimetype}`));
+    }
+    
+    const fieldDescription = isMainMediaField ? 'principal' : 'MediaManager';
+    console.log(`Archivo ${fieldDescription} aceptado: ${file.originalname} (${isImage ? 'imagen' : 'video'})`);
+    return cb(null, true);
+  } 
+  else {
+    // Por defecto, rechazar otros tipos de archivo desconocidos
+    console.warn(`Tipo de campo no reconocido: ${file.fieldname}, rechazado por seguridad`);
+    return cb(new Error(`Tipo de campo no soportado: ${file.fieldname}`));
+  }
+};
+
+// Constantes para los límites de tamaño
+const MAX_PHOTO_SIZE = 5 * 1024 * 1024; // 5MB para fotos
+const MAX_VIDEO_SIZE = 10 * 1024 * 1024; // 10MB para videos
+
+// Configurar manejo de errores para multer
+const multerErrorHandler = (err: any, req: Request, res: Response, next: Function) => {
+  if (err instanceof multer.MulterError) {
+    console.error("Error de Multer:", err.code, err.field);
+    
+    // Manejar errores específicos de multer con mensajes amigables
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({
+        success: false,
+        message: "El archivo es demasiado grande. El tamaño máximo permitido es 10MB para videos y 5MB para imágenes.",
+        error: 'FILE_TOO_LARGE',
+        field: err.field
+      });
+    }
+    
+    if (err.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({
+        success: false,
+        message: "Se han enviado demasiados archivos. Máximo 10 archivos por solicitud.",
+        error: 'TOO_MANY_FILES'
+      });
+    }
+    
+    // Otros errores de multer
+    return res.status(400).json({
+      success: false,
+      message: `Error al subir archivo: ${err.message}`,
+      error: err.code
+    });
+  }
+  
+  // Si no es un error de multer, pasar al siguiente middleware
+  if (err) {
+    return next(err);
+  }
+  
+  next();
+};
+
+// Configurar el middleware multer con mejores límites
+const upload = multer({ 
+  storage: storage_uploads,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: MAX_VIDEO_SIZE, // Usar el límite mayor (10MB) y validar específicamente en el código
+    files: 10, // Máximo 10 archivos por solicitud para evitar abusos
+  }
+});
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Serve static files from public directory
+  app.use(express.static('public'));
+
+  // Auth test route - force content type to be application/json
+  app.get("/api/auth/test", (req, res) => {
+    console.log("Auth test route accessed");
+    console.log("User:", req.user);
+    console.log("Auth header:", req.headers.authorization ? "Present" : "Not present");
+    
+    // Force content type to application/json
+    res.setHeader('Content-Type', 'application/json');
+    
+    return res.send(JSON.stringify({
+      success: true,
+      message: "Auth test route",
+      authenticated: !!req.user,
+      user: req.user || null
+    }));
+  });
+  
+  // Use Supabase auth routes
+  app.use('/api/auth', authRoutes);
+  
+  /* OLD AUTH ROUTES - REPLACED WITH SUPABASE */
+  app.post("/api/auth/register", async (req, res) => {
+    try {
+      console.log("Registration attempt with data:", { 
+        email: req.body.email,
+        username: req.body.username,
+        name: req.body.name
+      });
+      
+      // Validate all input data
+      const validatedData = insertUserSchema.parse(req.body);
+      
+      // Check if email already exists
+      const existingEmail = await storage.getUserByEmail(validatedData.email);
+      if (existingEmail) {
+        console.log(`Registration rejected: Email ${validatedData.email} already exists`);
+        return res.status(400).json({ message: "Email already in use" });
+      }
+
+      // Check if username already exists
+      const existingUsername = await storage.getUserByUsername(validatedData.username);
+      if (existingUsername) {
+        console.log(`Registration rejected: Username ${validatedData.username} already exists`);
+        return res.status(400).json({ message: "Username already taken" });
+      }
+
+      // Hash password with bcrypt
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(validatedData.password, salt);
+
+      // Create user with the hashed password
+      const user = await storage.insertUser({
+        ...validatedData,
+        password: hashedPassword,
+      });
+
+      console.log(`User registered successfully: ID=${user.id}, Username=${user.username}`);
+
+      // Remove password from the response data
+      const { password: _, ...userWithoutPassword } = user;
+
+      // Automatically log the user in after registration
+      req.login(userWithoutPassword, (err) => {
+        if (err) {
+          console.error("Error during auto-login after registration:", err);
+          return res.status(500).json({ message: "Registration successful, but automatic login failed" });
+        }
+        
+        console.log(`User ${user.id} automatically logged in after registration`);
+        return res.status(201).json(userWithoutPassword);
+      });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        console.log("Registration validation errors:", error.errors);
+        return res.status(400).json({ 
+          message: "Validation error",
+          errors: error.errors.map(e => ({
+            field: e.path.join('.'),
+            message: e.message
+          }))
+        });
+      }
+      console.error("Error registering user:", error);
+      return res.status(500).json({ message: "Internal server error during registration" });
+    }
+  });
+
+  // User login
+  app.post("/api/auth/login", (req, res, next) => {
+    try {
+      console.log("Login attempt for:", req.body.email);
+      
+      // Log request details for debugging
+      console.log("Login headers:", req.headers);
+      console.log("Login body:", req.body);
+      
+      // Validate login data
+      loginUserSchema.parse(req.body);
+      
+      // Use passport for authentication
+      passport.authenticate("local", (err: any, user: any, info: any) => {
+        if (err) {
+          console.error("Authentication error:", err);
+          return next(err);
+        }
+        
+        // Authentication failed
+        if (!user) {
+          console.log(`Login failed for ${req.body.email}: ${info?.message || "Unknown reason"}`);
+          return res.status(401).json({ message: info?.message || "Invalid email or password" });
+        }
+        
+        // User authenticated, establish session
+        req.login(user, (err) => {
+          if (err) {
+            console.error("Session error during login:", err);
+            return next(err);
+          }
+          
+          console.log(`User ${user.id} (${user.email}) authenticated, establishing session...`);
+          
+          // Force save the session immediately 
+          req.session.save((err) => {
+            if (err) {
+              console.error("Error saving session:", err);
+              return next(err);
+            }
+            
+            console.log(`User ${user.id} (${user.email}) logged in successfully`);
+            
+            // Debug session info
+            if (req.session) {
+              console.log(`Session created: id=${req.session.id}, expires=${req.session.cookie.expires}`);
+              console.log("Session cookie:", req.session.cookie);
+              // Set a test value in the session
+              (req.session as any).loginTime = new Date().toISOString();
+              (req.session as any).userId = user.id;
+            }
+            
+            // Set the cookie manually to ensure persistence
+            res.cookie('pipol.sid', req.sessionID, {
+              maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days in milliseconds
+              httpOnly: true,
+              secure: false, // Change to true in production (HTTPS)
+              path: '/',
+              sameSite: 'none'
+            });
+            
+            // Log authentication status for debugging
+            console.log("Is authenticated after login:", req.isAuthenticated());
+            
+            // Return user data without debug information for production use
+            return res.json(user);
+          });
+        });
+      })(req, res, next);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        console.log("Login validation errors:", error.errors);
+        return res.status(400).json({ 
+          message: "Invalid login data", 
+          errors: error.errors
+        });
+      }
+      console.error("Unexpected login error:", error);
+      return res.status(500).json({ message: "Internal server error during login" });
+    }
+  });
+
+  // Test auth endpoint to verify authentication status
+  app.get("/api/auth/test", (req, res) => {
+    try {
+      if (req.isAuthenticated()) {
+        console.log(`Auth test successful for user ${req.user.id}`);
+        return res.json({ 
+          authenticated: true, 
+          userId: req.user.id,
+          sessionId: req.sessionID
+        });
+      } else {
+        console.log("Auth test failed: Not authenticated");
+        return res.status(401).json({ 
+          authenticated: false,
+          sessionId: req.sessionID || null
+        });
+      }
+    } catch (error) {
+      console.error("Error in auth test:", error);
+      return res.status(500).json({ message: "Error checking authentication status" });
+    }
+  });
+
+  // Use the Supabase auth routes
+  app.use("/api/auth", authRoutes);
+  
+  // Legacy endpoint for compatibility
+  app.get("/api/auth/me", isAuthenticated, (req, res) => {
+    try {
+      if (!req.user) {
+        console.log("Auth check for GET /api/auth/me: Not authenticated");
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+      
+      console.log(`User data requested for user ${req.user.id}`);
+      return res.json(req.user);
+    } catch (error) {
+      console.error("Error in /api/auth/me:", error);
+      return res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // User logout
+  app.post("/api/auth/logout", (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(200).json({ message: "Already logged out" });
+    }
+    
+    // Store user ID for logging
+    const userId = req.user.id;
+    console.log(`Logout requested for user ${userId}`);
+    
+    req.logout((err) => {
+      if (err) {
+        console.error("Error during logout:", err);
+        return res.status(500).json({ message: "Error during logout" });
+      }
+      
+      // Destroy the session completely
+      req.session.destroy((err) => {
+        if (err) {
+          console.error("Error destroying session:", err);
+        }
+        
+        console.log(`User ${userId} logged out successfully`);
+        res.clearCookie('connect.sid');
+        res.json({ message: "Logged out successfully" });
+      });
+    });
+  });
+  
+  // Proxy para solicitudes a la API de Google Places (para evitar problemas CORS)
+  app.get('/api/google-proxy/:service/:endpoint', async (req, res) => {
+    try {
+      const { service, endpoint } = req.params;
+      // Copiar los query params para no modificar el objeto original
+      const queryParams = { ...req.query };
+      
+      // Eliminar clave 'key' del query string
+      if (queryParams.key) {
+        delete queryParams.key;
+      }
+      
+      // Si es una solicitud de búsqueda, agregamos parámetros para mejorar los resultados
+      if (endpoint === 'textsearch' || endpoint === 'findplacefromtext') {
+        // Priorizar la región del usuario (Argentina) para mostrar resultados más relevantes
+        if (!queryParams.region && !queryParams.location) {
+          queryParams.region = 'ar'; // Argentina
+        }
+        
+        // Si la consulta es muy genérica (como 'parque'), agregar más contexto
+        if (queryParams.query && typeof queryParams.query === 'string' && queryParams.query.length < 10) {
+          // Agregar "en Argentina" o "en Mexico" según la región especificada
+          const region = queryParams.region || 'ar';
+          const countryName = region === 'ar' ? 'Argentina' : (region === 'mx' ? 'México' : '');
+          
+          if (countryName && !queryParams.query.includes(countryName)) {
+            queryParams.query = `${queryParams.query} en ${countryName}`;
+            console.log('Query modificada para mejorar resultados:', queryParams.query);
+          }
+        }
+        
+        // Parámetros para mejorar resultados
+        queryParams.language = 'es'; // Resultados en español
+        queryParams.inputtype = 'textquery';
+        
+        // Aumentar el número de resultados
+        if (!queryParams.maxResults) {
+          queryParams.maxResults = '10';
+        }
+      }
+      
+      // Usar la API key del servidor para mayor seguridad
+      const API_KEY = 'AIzaSyCy5iYWFh36MvrxPKr58A7TPd-f6YHtT1I';
+      
+      const urlParams = new URLSearchParams(queryParams as Record<string, string>).toString();
+      const url = `https://maps.googleapis.com/maps/api/${service}/${endpoint}?${urlParams}&key=${API_KEY}`;
+      console.log(`Proxying Google API request to: ${url}`);
+      
+      const response = await fetch(url);
+      
+      if (!response.ok) {
+        console.error('Error en respuesta HTTP de Google API:', response.status, response.statusText);
+        return res.status(response.status).json({ 
+          status: 'ERROR',
+          error_message: `Error HTTP ${response.status}: ${response.statusText}` 
+        });
+      }
+      
+      // Parsear la respuesta como texto primero para depurar cualquier problema
+      const responseText = await response.text();
+      
+      try {
+        // Intentar parsear JSON
+        const data = JSON.parse(responseText);
+        console.log('Google API response status:', data.status);
+        
+        if (data.status !== 'OK') {
+          console.log('Google API error details:', data.error_message || 'No error message provided');
+        } else {
+          console.log('Google API returned', data.results?.length || 0, 'results');
+        }
+        
+        return res.json(data);
+      } catch (jsonError) {
+        console.error('Error parsing Google API response as JSON:', jsonError);
+        console.error('Response text (first 200 chars):', responseText.substring(0, 200));
+        
+        return res.status(500).json({ 
+          status: 'ERROR',
+          error_message: 'Error parsing Google API response',
+          response_preview: responseText.substring(0, 100) + '...' 
+        });
+      }
+    } catch (error) {
+      console.error('Error proxy Google API:', error);
+      res.status(500).json({ 
+        status: 'ERROR',
+        error_message: error instanceof Error ? error.message : 'Unknown error in Google API proxy'
+      });
+    }
+  });
+
+  // Event routes
+  // Ruta para obtener un evento específico por ID
+  app.get("/api/events/:id", async (req, res) => {
+    try {
+      const eventId = parseInt(req.params.id);
+      const event = await storage.getEventById(eventId);
+      
+      if (!event) {
+        return res.status(404).json({ message: "Evento no encontrado" });
+      }
+      
+      // Incluir organizador
+      const organizer = await storage.getUserById(event.organizerId);
+      
+      // Obtener lista de asistentes
+      const attendees = await storage.getEventAttendees(eventId);
+      
+      // Formatear respuesta
+      const eventWithDetails = {
+        ...event,
+        organizer: organizer ? {
+          id: organizer.id,
+          name: organizer.name,
+          avatar: organizer.avatar
+        } : null,
+        attendees: attendees ? await Promise.all(attendees.map(async (attendee) => {
+          const user = await storage.getUserById(attendee.userId);
+          return {
+            id: attendee.id,
+            user: user ? {
+              id: user.id,
+              name: user.name,
+              avatar: user.avatar
+            } : null
+          };
+        })) : []
+      };
+      
+      res.json(eventWithDetails);
+    } catch (error) {
+      console.error("Error fetching event by ID:", error);
+      res.status(500).json({ message: "Error al obtener detalles del evento" });
+    }
+  });
+  
+  // Obtener todos los eventos
+  app.get("/api/events", async (req, res) => {
+    try {
+      const { lat, lng, radius, category, paymentType } = req.query;
+      
+      let events;
+      
+      // If lat and lng are provided, get nearby events
+      if (lat && lng) {
+        events = await storage.getNearbyEvents(
+          parseFloat(lat as string),
+          parseFloat(lng as string),
+          radius ? parseFloat(radius as string) : 10
+        );
+      } else {
+        // Otherwise get all events with filters
+        const filters: any = {};
+        
+        if (category) {
+          filters.category = Array.isArray(category) ? category : [category as string];
+        }
+        
+        if (paymentType) {
+          filters.paymentType = Array.isArray(paymentType) ? paymentType : [paymentType as string];
+        }
+        
+        events = await storage.getEvents(filters);
+      }
+      
+      res.json(events);
+    } catch (error) {
+      console.error("Error fetching events:", error);
+      res.status(500).json({ message: "Error fetching events" });
+    }
+  });
+
+  app.get("/api/events/:id", async (req, res) => {
+    try {
+      const eventId = parseInt(req.params.id);
+      const event = await storage.getEventById(eventId);
+      
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+      
+      res.json(event);
+    } catch (error) {
+      console.error("Error fetching event:", error);
+      res.status(500).json({ message: "Error fetching event" });
+    }
+  });
+
+  app.post("/api/events", isAuthenticated, (req, res, next) => {
+    // Aplicar upload como middleware con manejo de errores integrado
+    // Usamos upload.any() para aceptar cualquier campo de archivo
+    // Esto evitará el error "Unexpected field"
+    const uploadMiddleware = upload.any();
+    
+    uploadMiddleware(req, res, (err) => {
+      if (err) {
+        return multerErrorHandler(err, req, res, next);
+      }
+      next();
+    });
+  }, async (req, res) => {
+    try {
+      console.log("Creando evento. Datos recibidos:", JSON.stringify(req.body));
+      const userId = (req.user as any).id;
+      console.log("Usando organizerId:", userId);
+      
+      // Definir interfaz para los elementos multimedia
+      interface MediaItem {
+        type: string;
+        url: string;
+        order: number;
+        isMain?: boolean;
+      }
+      
+      // CORRECCIÓN DEL BUG: El error "undefined" ocurre cuando hay problemas 
+      // al procesar los archivos o el campo mediaItems durante la creación
+      
+      // Inicializamos variables con valores por defecto seguros
+      let photoUrl = '';
+      let videoUrl = '';
+      let mediaItems: MediaItem[] = [];
+      let mainMediaType = 'photo'; // Valor por defecto seguro
+      let mainMediaUrl = '';
+      const filesByField: {[key: string]: Express.Multer.File[]} = {};
+      
+      try {
+        // Procesamos archivos subidos si existen con validación robusta
+        const files = req.files as Express.Multer.File[] || [];
+        
+        // Loguear información útil para depuración
+        console.log("¿Hay archivos?", Array.isArray(files) && files.length > 0);
+        
+        if (Array.isArray(files) && files.length > 0) {
+          console.log("Archivos recibidos:", files.map(f => ({
+            fieldname: f.fieldname,
+            originalname: f.originalname,
+            mimetype: f.mimetype,
+            size: f.size
+          })));
+          
+          // Agrupar archivos por fieldname para facilitar procesamiento con validación
+          files.forEach(file => {
+            if (file && file.fieldname) {
+              if (!filesByField[file.fieldname]) {
+                filesByField[file.fieldname] = [];
+              }
+              filesByField[file.fieldname].push(file);
+            }
+          });
+        } else {
+          console.log("No se recibieron archivos adjuntos");
+        }
+      } catch (err) {
+        console.error("Error al procesar archivos:", err);
+        // No propagamos el error, continuamos con un estado limpio
+      }
+      
+      console.log("Campos de archivos encontrados:", Object.keys(filesByField).length > 0 ? Object.keys(filesByField) : "ninguno");
+      
+      // Procesar archivo principal (retrocompatibilidad)
+      if (filesByField.eventPhoto) {
+        const photoFile = filesByField.eventPhoto[0];
+        const photoPath = photoFile.path.replace('public', '');
+        photoUrl = photoPath; // URL relativa para el navegador
+        console.log(`Procesando eventPhoto: ${photoFile.originalname} -> ${photoPath}`);
+        
+        // Si no hay un medio principal definido, usar esta foto como principal
+        if (!mainMediaUrl) {
+          mainMediaUrl = photoPath;
+          mainMediaType = 'photo';
+          console.log(`Estableciendo eventPhoto como medio principal: ${photoPath}`);
+        }
+        
+        // No añadimos a mediaItems aquí, lo haremos mediante MediaManager
+      }
+      
+      if (filesByField.eventVideo) {
+        const videoFile = filesByField.eventVideo[0];
+        const videoPath = videoFile.path.replace('public', '');
+        videoUrl = videoPath; // URL relativa para el navegador
+        console.log(`Procesando eventVideo: ${videoFile.originalname} -> ${videoPath}`);
+        
+        // No añadimos a mediaItems aquí, lo haremos mediante MediaManager
+      }
+      
+      // Procesar fotos adicionales (retrocompatibilidad)
+      if (filesByField.photos) {
+        const photoUrls = filesByField.photos.map(file => {
+          console.log(`Procesando foto adicional: ${file.originalname}`);
+          return file.path.replace('public', '');
+        });
+        
+        // Si no hay un medio principal definido y hay fotos, usar la primera foto como principal
+        if (!mainMediaUrl && photoUrls.length > 0) {
+          mainMediaUrl = photoUrls[0];
+          mainMediaType = 'photo';
+          console.log(`Estableciendo primera foto como medio principal: ${mainMediaUrl}`);
+        }
+        
+        // No añadimos a mediaItems aquí, lo haremos mediante MediaManager
+      }
+      
+      // Procesar videos adicionales (retrocompatibilidad)
+      if (filesByField.videos) {
+        filesByField.videos.forEach(file => {
+          console.log(`Procesando video adicional: ${file.originalname}`);
+          // No añadimos a mediaItems aquí, lo haremos mediante MediaManager
+        });
+      }
+      
+      // Procesar el archivo principal especificado
+      if (filesByField.mainMediaFile) {
+        const mainFile = filesByField.mainMediaFile[0];
+        const mediaPath = mainFile.path.replace('public', '');
+        // Determinar tipo según el mimetype
+        const isVideo = mainFile.mimetype.startsWith('video/');
+        mainMediaType = isVideo ? 'video' : 'photo';
+        mainMediaUrl = mediaPath;
+        
+        console.log("======= ESTABLECIENDO MEDIA PRINCIPAL EXPLÍCITO =======");
+        console.log(`ARCHIVO: ${mainFile.originalname}`);
+        console.log(`TIPO: ${mainMediaType}`);
+        console.log(`URL: ${mainMediaUrl}`);
+        console.log(`TAMAÑO: ${(mainFile.size/1024).toFixed(1)}KB`);
+        console.log("=====================================================");
+      }
+      
+      // Procesar archivos de MediaManager con robusto manejo de errores y validación
+      // para evitar el error "undefined" cuando faltan valores
+      // Primero verificar si existe la información de mediaItems como JSON
+      if (req.body && req.body.mediaItems) {
+        try {
+          console.log("MediaItems JSON recibido:", req.body.mediaItems);
+          
+          // Parse de la información de mediaItems con validación para evitar undefined
+          let mediaItemsInfo = [];
+          try {
+            mediaItemsInfo = JSON.parse(req.body.mediaItems) || [];
+            // Asegurar que es un array
+            if (!Array.isArray(mediaItemsInfo)) {
+              console.warn("mediaItemsInfo no es un array, usando array vacío");
+              mediaItemsInfo = [];
+            }
+          } catch (parseError) {
+            console.error("Error al parsear JSON de mediaItems:", parseError);
+            console.warn("Usando array vacío como valor seguro para mediaItemsInfo");
+            mediaItemsInfo = [];
+          }
+          
+          console.log("MediaItems parseado:", mediaItemsInfo);
+          
+          // Buscar archivos subidos con patrón mediaFile_X con validación para objetos undefined
+          const mediaFileKeys = Object.keys(filesByField || {})
+            .filter(key => key && typeof key === 'string' && key.startsWith('mediaFile_'));
+            
+          console.log("Claves de archivos multimedia encontradas:", mediaFileKeys);
+          console.log("Todos los archivos recibidos:", Object.keys(filesByField || {}));
+          
+          // Variable para rastrear el elemento principal con inicialización segura
+          let mainItemFound = false;
+          
+          if (mediaFileKeys.length > 0) {
+            console.log(`Procesando ${mediaFileKeys.length} archivos de MediaManager`);
+            
+            // No vaciamos el array de mediaItems para mantener la compatibilidad
+            // mediaItems = [];
+            
+            // Crear nueva lista mediaItems basada en los archivos subidos y la metadata
+            const newMediaItems: MediaItem[] = [];
+            
+            // Contador para validar límites
+            let photoCount = 0;
+            let videoCount = 0;
+            const MAX_PHOTOS = 6;
+            const MAX_VIDEOS = 3;
+            const MAX_PHOTO_SIZE = 5 * 1024 * 1024; // 5MB
+            const MAX_VIDEO_SIZE = 10 * 1024 * 1024; // 10MB
+            
+            // Crear un array de promesas para procesar todos los archivos
+            for (const key of mediaFileKeys) {
+              try {
+                // Acceso seguro a los archivos utilizando filesByField
+                if (!filesByField[key] || !filesByField[key][0]) {
+                  console.warn(`No se encontró archivo para ${key}`);
+                  continue;
+                }
+                
+                const file = filesByField[key][0];
+                const mediaPath = file.path.replace('public', '');
+                
+                // Extraer índice del nombre de campo (mediaFile_X)
+                const indexMatch = key.match(/mediaFile_(\d+)/);
+                if (!indexMatch) {
+                  console.warn(`No se pudo extraer índice de ${key}`);
+                  continue;
+                }
+                
+                const index = parseInt(indexMatch[1]);
+                
+                // Determinar el tipo de archivo
+                const isVideo = file.mimetype.startsWith('video/');
+                const fileType = isVideo ? 'video' : 'photo';
+                
+                // Validar tamaño del archivo
+                const isOversize = isVideo 
+                  ? file.size > MAX_VIDEO_SIZE 
+                  : file.size > MAX_PHOTO_SIZE;
+                
+                if (isOversize) {
+                  console.warn(`Archivo ${key} excede el tamaño máximo permitido: ${(file.size / (1024 * 1024)).toFixed(1)}MB`);
+                  
+                  // Eliminar el archivo que excede el tamaño
+                  try {
+                    fs.unlinkSync(file.path);
+                    console.log(`Archivo sobredimensionado eliminado: ${file.path}`);
+                  } catch (unlinkError) {
+                    console.error(`Error eliminando archivo sobredimensionado: ${file.path}`, unlinkError);
+                  }
+                  
+                  continue;
+                }
+                
+                // Verificar límites por tipo
+                if (isVideo && videoCount >= MAX_VIDEOS) {
+                  console.warn(`Se excedió el límite de videos (${MAX_VIDEOS}), omitiendo ${key}`);
+                  
+                  // Eliminar el archivo excedente
+                  try {
+                    fs.unlinkSync(file.path);
+                    console.log(`Archivo excedente eliminado: ${file.path}`);
+                  } catch (unlinkError) {
+                    console.error(`Error eliminando archivo excedente: ${file.path}`, unlinkError);
+                  }
+                  
+                  continue;
+                } else if (!isVideo && photoCount >= MAX_PHOTOS) {
+                  console.warn(`Se excedió el límite de fotos (${MAX_PHOTOS}), omitiendo ${key}`);
+                  
+                  // Eliminar el archivo excedente
+                  try {
+                    fs.unlinkSync(file.path);
+                    console.log(`Archivo excedente eliminado: ${file.path}`);
+                  } catch (unlinkError) {
+                    console.error(`Error eliminando archivo excedente: ${file.path}`, unlinkError);
+                  }
+                  
+                  continue;
+                }
+                
+                // Incrementar el contador correspondiente
+                if (isVideo) {
+                  videoCount++;
+                } else {
+                  photoCount++;
+                }
+                
+                // Buscar la metadata correspondiente con validación robusta
+                let matchedMetadata = null;
+                
+                // Buscar por ID en la metadata con múltiples capas de validación
+                if (Array.isArray(mediaItemsInfo) && mediaItemsInfo.length > 0) {
+                  for (const item of mediaItemsInfo) {
+                    // Verificar que el item es un objeto válido
+                    if (item && typeof item === 'object') {
+                      // Verificar si el índice del elemento coincide con el índice del archivo
+                      // o si la propiedad id contiene el índice
+                      const hasMatchingOrder = typeof item.order === 'number' && item.order === index;
+                      const hasMatchingId = item.id && typeof item.id === 'string' && item.id.includes(`_${index}`);
+                      
+                      if (hasMatchingOrder || hasMatchingId) {
+                        matchedMetadata = item;
+                        console.log(`Encontrada metadata para archivo ${key} por ID/orden:`, matchedMetadata);
+                        break;
+                      }
+                    }
+                  }
+                  
+                  // Si no encontramos por ID, intentamos por posición en la lista con validación
+                  if (!matchedMetadata && index < mediaItemsInfo.length) {
+                    const possibleMatch = mediaItemsInfo[index];
+                    // Verificar que el elemento encontrado es un objeto válido
+                    if (possibleMatch && typeof possibleMatch === 'object') {
+                      matchedMetadata = possibleMatch;
+                      console.log(`Encontrada metadata para archivo ${key} por posición en array:`, matchedMetadata);
+                    }
+                  }
+                }
+                
+                // Si aún no tenemos metadata, creamos un objeto seguro con valores por defecto
+                if (!matchedMetadata) {
+                  console.log(`No se encontró metadata para archivo ${key}, usando valores por defecto`);
+                  matchedMetadata = {
+                    type: fileType, // Usar el tipo detectado del mimetype
+                    order: index,
+                    isMain: false
+                  };
+                }
+                
+                // Log para depuración
+                console.log(`Procesando archivo ${key} con metadata final:`, matchedMetadata);
+                
+                // Crear el objeto MediaItem con valores por defecto seguros
+                // para evitar cualquier valor undefined o null
+                const mediaItem: MediaItem = {
+                  // Usar tipo de la metadata o determinarlo por el mimetype con valor seguro
+                  type: (matchedMetadata && matchedMetadata.type) ? matchedMetadata.type : fileType,
+                  url: mediaPath,
+                  // Usar orden de la metadata o usar el índice con valor seguro
+                  order: (matchedMetadata && typeof matchedMetadata.order === 'number') ? 
+                         matchedMetadata.order : index,
+                  // Usar isMain de la metadata o false por defecto con verificación estricta
+                  isMain: !!(matchedMetadata && matchedMetadata.isMain === true)
+                };
+                
+                console.log(`Media item creado: ${mediaItem.type}, isMain: ${mediaItem.isMain}, URL: ${mediaItem.url}`);
+                
+                console.log(`Procesado archivo ${key}: ${mediaItem.type}, isMain: ${mediaItem.isMain}, tamaño: ${(file.size / 1024).toFixed(1)}KB`);
+                newMediaItems.push(mediaItem);
+                
+                // Si es el elemento principal, actualizar mainMediaType y mainMediaUrl
+                if (mediaItem.isMain) {
+                  mainMediaType = mediaItem.type;
+                  mainMediaUrl = mediaItem.url;
+                  console.log(`Archivo ${key} establecido como principal: ${mainMediaType} - ${mainMediaUrl}`);
+                }
+              } catch (error) {
+                console.error(`Error procesando archivo ${key}:`, error);
+              }
+            }
+            
+            // Reemplazar mediaItems con los nuevos
+            if (newMediaItems.length > 0) {
+              // Ordenar por la propiedad order para mantener el orden especificado
+              newMediaItems.sort((a, b) => (a.order || 0) - (b.order || 0));
+              
+              // Verificar si hay un elemento principal
+              const hasMainItem = newMediaItems.some(item => item.isMain === true);
+              
+              console.log(`¿Existe elemento principal explícito? ${hasMainItem}`);
+              
+              // Si no hay elemento principal, establecer el primero como principal
+              // priorizando fotos sobre videos
+              if (!hasMainItem && newMediaItems.length > 0) {
+                const firstPhoto = newMediaItems.find(item => item.type === 'photo');
+                const itemToSetMain = firstPhoto || newMediaItems[0];
+                
+                itemToSetMain.isMain = true;
+                mainMediaType = itemToSetMain.type;
+                mainMediaUrl = itemToSetMain.url;
+                
+                console.log(`Estableciendo elemento principal automáticamente: ${mainMediaType} - ${mainMediaUrl}`);
+              } else if (hasMainItem) {
+                // Obtener el elemento principal explícito
+                const mainItem = newMediaItems.find(item => item.isMain === true);
+                if (mainItem) {
+                  mainMediaType = mainItem.type;
+                  mainMediaUrl = mainItem.url;
+                  console.log(`Usando elemento principal explícito: ${mainMediaType} - ${mainMediaUrl}`);
+                }
+              }
+              
+              // Simplificamos el procesamiento de los archivos multimedia
+              
+              // Reemplazamos completamente los mediaItems con los nuevos elementos
+              // Esto evita la duplicación de archivos
+              mediaItems = newMediaItems;
+              console.log("Reemplazando mediaItems con los nuevos elementos procesados");
+              
+              console.log(`Total de elementos multimedia: ${mediaItems.length} (incluyendo ${newMediaItems.length} nuevos)`);
+              console.log(`Composición: ${mediaItems.filter(i => i.type === 'photo').length} fotos, ${mediaItems.filter(i => i.type === 'video').length} videos`);
+            }
+          }
+        } catch (error) {
+          console.error("Error procesando mediaItems JSON:", error);
+        }
+      }
+      
+      // Verificar si tenemos elementos multimedia antes de continuar
+      console.log("Estado final de los mediaItems antes de guardar:", 
+        mediaItems.map(item => ({
+          tipo: item.type,
+          url: item.url,
+          orden: item.order || 0,
+          principal: item.isMain || false
+        }))
+      );
+      
+      // Verificar estado de los medios principales
+      console.log("Media principal:", {
+        mainMediaType,
+        mainMediaUrl
+      });
+      
+      // Convertir mediaItems a JSON string
+      const mediaItemsJson = JSON.stringify(mediaItems);
+      
+      try {
+        const validatedData = insertEventSchema.parse({
+          ...req.body,
+          organizerId: userId,
+          // Añadir URLs de los archivos (mantener por compatibilidad)
+          photoUrl: photoUrl || req.body.photoUrl || null,
+          videoUrl: videoUrl || req.body.videoUrl || null,
+          // Nuevos campos multimedia
+          mediaItems: mediaItemsJson,
+          mainMediaType: mainMediaType,
+          mainMediaUrl: mainMediaUrl
+        });
+        console.log("Datos validados:", JSON.stringify(validatedData));
+        
+        const event = await storage.insertEvent(validatedData);
+        console.log("Evento creado con éxito:", JSON.stringify(event));
+        res.status(201).json(event);
+      } catch (validationError) {
+        console.error("Error de validación:", validationError);
+        // Si hay error, eliminar los archivos subidos
+        // Con upload.any() ya no tenemos acceso a los archivos así
+        // Eliminamos los archivos por el array filesByField
+        if (filesByField.eventPhoto && filesByField.eventPhoto.length > 0) {
+          try {
+            fs.unlinkSync(filesByField.eventPhoto[0].path);
+          } catch (err) {
+            console.error("Error al eliminar archivo:", err);
+          }
+        }
+        if (filesByField.eventVideo && filesByField.eventVideo.length > 0) {
+          try {
+            fs.unlinkSync(filesByField.eventVideo[0].path);
+          } catch (err) {
+            console.error("Error al eliminar archivo:", err);
+          }
+        }
+        
+        if (validationError instanceof z.ZodError) {
+          return res.status(400).json({ errors: validationError.errors });
+        }
+        throw validationError;
+      }
+    } catch (error) {
+      console.error("Error completo al crear evento:", error);
+      
+      // Check if this is a foreign key constraint error
+      if (error instanceof Error && 
+          error.toString().includes("violates foreign key constraint") &&
+          error.toString().includes("events_organizer_id_users_id_fk")) {
+        return res.status(401).json({ 
+          message: "You need to sign up and log in before creating an event",
+          code: "USER_NOT_FOUND"
+        });
+      }
+      
+      res.status(500).json({ message: "Error creating event", error: String(error) });
+    }
+  });
+
+  // Ruta PUT para actualización básica sin archivos
+  app.put("/api/events/:id", isAuthenticated, async (req, res) => {
+    try {
+      // Debug: Qué contiene la solicitud PUT
+      console.log("===== DATOS RECIBIDOS EN PUT =====");
+      console.log("Content-Type:", req.get('Content-Type'));
+      console.log("Headers:", JSON.stringify(req.headers, null, 2));
+      console.log("Body keys:", Object.keys(req.body));
+      
+      const user = req.user as any;
+      const eventId = parseInt(req.params.id);
+      
+      // Check if event exists
+      const event = await storage.getEventById(eventId);
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+      
+      // Check if user is the organizer
+      if (event.organizerId !== user.id) {
+        return res.status(403).json({ message: "Not authorized to update this event" });
+      }
+      
+      // Create a copy of the request body for updating
+      const updateData = { ...req.body };
+      
+      // Procesar la fecha correctamente si existe
+      if (updateData.date) {
+        try {
+          // Convertir la fecha a un objeto Date apropiado
+          updateData.date = new Date(updateData.date);
+          console.log("Date converted to:", updateData.date);
+        } catch (error) {
+          console.error("Error converting date:", error);
+          return res.status(400).json({ message: "Invalid date format" });
+        }
+      }
+      
+      // Procesar mediaItems si existen para actualizar mainMediaType y mainMediaUrl
+      if (updateData.mediaItems) {
+        console.log("Actualizando evento en la base de datos. ID:", eventId);
+        console.log("Datos de multimedia a guardar:");
+        console.log("- mediaItems:", updateData.mediaItems);
+        console.log("- mainMediaType:", updateData.mainMediaType);
+        console.log("- mainMediaUrl:", updateData.mainMediaUrl);
+        
+        try {
+          // Convertir mediaItems de string a objeto JSON si es necesario
+          let mediaItems = updateData.mediaItems;
+          if (typeof mediaItems === 'string') {
+            mediaItems = JSON.parse(mediaItems);
+          }
+          
+          // Buscar el elemento principal
+          const mainItem = Array.isArray(mediaItems) ? 
+            mediaItems.find(item => item && item.isMain === true) : null;
+          
+          // Si hay un elemento principal, actualizar mainMediaType y mainMediaUrl
+          if (mainItem) {
+            updateData.mainMediaType = mainItem.type;
+            updateData.mainMediaUrl = mainItem.url;
+            console.log("Elemento principal encontrado y actualizado:", {
+              type: mainItem.type,
+              url: mainItem.url
+            });
+          } else if (Array.isArray(mediaItems) && mediaItems.length > 0) {
+            // Si no hay elemento principal pero hay elementos, usar el primero
+            updateData.mainMediaType = mediaItems[0].type;
+            updateData.mainMediaUrl = mediaItems[0].url;
+            console.log("Usando primer elemento como principal por defecto:", {
+              type: mediaItems[0].type,
+              url: mediaItems[0].url
+            });
+          }
+        } catch (error) {
+          console.error("Error procesando mediaItems:", error);
+        }
+        
+        // Verificación después de actualizar
+        console.log("Verificación después de actualizar:");
+        console.log("- mediaItems almacenados:", updateData.mediaItems);
+        console.log("- mainMediaType almacenado:", updateData.mainMediaType);
+        console.log("- mainMediaUrl almacenado:", updateData.mainMediaUrl);
+      }
+      
+      // Obtener evento original para comparar medios
+      const originalEvent = await storage.getEventById(eventId);
+      
+      // Detectar si hay cambios en los medios
+      let mediaChanged = false;
+      
+      if (originalEvent) {
+        // Verificar cambios en URL de medio principal o tipo
+        if (originalEvent.mainMediaUrl !== updateData.mainMediaUrl || 
+            originalEvent.mainMediaType !== updateData.mainMediaType) {
+          mediaChanged = true;
+          console.log("Cambio detectado en medio principal:");
+          console.log(`- Original: ${originalEvent.mainMediaType} - ${originalEvent.mainMediaUrl}`);
+          console.log(`- Nuevo: ${updateData.mainMediaType} - ${updateData.mainMediaUrl}`);
+        }
+        
+        // Verificar cambios en la colección de medios
+        try {
+          const originalMediaItems = originalEvent.mediaItems ? JSON.parse(originalEvent.mediaItems) : [];
+          const newMediaItems = typeof updateData.mediaItems === 'string' 
+            ? JSON.parse(updateData.mediaItems) 
+            : updateData.mediaItems;
+            
+          if (JSON.stringify(originalMediaItems) !== JSON.stringify(newMediaItems)) {
+            mediaChanged = true;
+            console.log("Cambio detectado en colección de medios");
+          }
+        } catch (error) {
+          console.error("Error comparando mediaItems:", error);
+        }
+      }
+      
+      // Update event
+      const updatedEvent = await storage.updateEvent(eventId, updateData);
+      console.log("Evento actualizado correctamente.");
+      console.log(`¿Hubo cambios en los medios? ${mediaChanged ? 'SÍ' : 'NO'}`);
+      
+      // Broadcast event update to all connected clients via WebSocket
+      broadcastMessage({
+        type: 'event_updated',
+        event: updatedEvent,
+        updatedBy: user.id  // Agregar el ID del usuario que realizó la actualización
+      });
+      
+      // Si se actualizó el medio principal, envía un mensaje específico para esto
+      if (mediaChanged) {
+        broadcastMessage({
+          type: 'event_media_updated',
+          eventId: updatedEvent.id,
+          updatedBy: user.id
+        });
+      }
+      
+      console.log("Notificación de actualización de evento enviada a todos los clientes WebSocket");
+      
+      res.json(updatedEvent);
+    } catch (error) {
+      console.error("Error updating event:", error);
+      res.status(500).json({ message: "Error updating event" });
+    }
+  });
+  
+  // Ruta PATCH para actualización con archivos
+  app.patch("/api/events/:id", isAuthenticated, (req, res, next) => {
+    // Aplicar upload como middleware con manejo de errores integrado
+    const uploadMiddleware = upload.fields([
+      { name: 'eventPhoto', maxCount: 1 }, // Mantener para compatibilidad
+      { name: 'eventVideo', maxCount: 1 }, // Mantener para compatibilidad
+      { name: 'photos', maxCount: 6 },  // Permitir hasta 6 fotos en total
+      { name: 'videos', maxCount: 3 },  // Permitir hasta 3 videos en total
+      { name: 'mainMedia', maxCount: 1 }, // Archivo principal (puede ser foto o video)
+      { name: 'mainMediaFile', maxCount: 1 }, // Archivo principal (nuevo nombre usado en el frontend)
+      // Nuevos campos para MediaManager
+      { name: 'mediaFile_0', maxCount: 1 },
+      { name: 'mediaFile_1', maxCount: 1 },
+      { name: 'mediaFile_2', maxCount: 1 },
+      { name: 'mediaFile_3', maxCount: 1 },
+      { name: 'mediaFile_4', maxCount: 1 },
+      { name: 'mediaFile_5', maxCount: 1 },
+      { name: 'mediaFile_6', maxCount: 1 },
+      { name: 'mediaFile_7', maxCount: 1 },
+      { name: 'mediaFile_8', maxCount: 1 },
+      { name: 'mediaFile_9', maxCount: 1 }
+    ]);
+    
+    uploadMiddleware(req, res, (err) => {
+      if (err) {
+        return multerErrorHandler(err, req, res, next);
+      }
+      next();
+    });
+  }, async (req, res) => {
+    try {
+      const user = req.user as any;
+      const eventId = parseInt(req.params.id);
+      
+      // Check if event exists
+      const event = await storage.getEventById(eventId);
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+      
+      // Check if user is the organizer
+      if (event.organizerId !== user.id) {
+        return res.status(403).json({ message: "Not authorized to update this event" });
+      }
+      
+      // Procesar archivos subidos
+      const files = req.files as { [fieldname: string]: Express.Multer.File[] };
+      console.log("Archivos recibidos:", Object.keys(files).length > 0 ? Object.keys(files) : "ninguno");
+      
+      // Datos para actualizar
+      const updateData: any = { ...req.body };
+      
+      // Detectar si hay nuevos archivos multimedia (qualquier tipo)
+      const hasNewMediaFiles = Object.keys(files).some(key => 
+        key.startsWith('mediaFile_') || 
+        key === 'mainMediaFile' || 
+        key === 'photos' || 
+        key === 'videos'
+      );
+      
+      console.log("¿Hay nuevos archivos multimedia?", hasNewMediaFiles);
+      
+      // Procesar la fecha correctamente si existe
+      if (updateData.date) {
+        try {
+          // Convertir la fecha a un objeto Date apropiado
+          updateData.date = new Date(updateData.date);
+          console.log("Date converted to:", updateData.date);
+        } catch (error) {
+          console.error("Error converting date:", error);
+          return res.status(400).json({ message: "Invalid date format" });
+        }
+      }
+      
+      // Definir interfaz para los elementos multimedia
+      interface MediaItem {
+        type: string;
+        url: string;
+        order: number;
+        isMain?: boolean;
+      }
+      
+      // Definir interfaces para la información de medios
+      interface MediaItemInfo {
+        id?: string;
+        type: string;
+        url?: string;
+        isMain?: boolean;
+        isNew?: boolean;
+        fileIndex?: number;
+        order?: number;
+        deleted?: boolean;
+        toDelete?: boolean;
+      }
+      
+      // Definir array para almacenar los elementos multimedia
+      let mediaItems: MediaItem[] = [];
+      let mainMediaType = req.body.mainMediaType || 'photo';
+      let mainMediaUrl = req.body.mainMediaUrl || '';
+      
+      // Parsear información de elementos multimedia si existe
+      let mediaItemsInfo: MediaItemInfo[] = [];
+      if (req.body.mediaItemsInfo) {
+        try {
+          mediaItemsInfo = JSON.parse(req.body.mediaItemsInfo);
+          console.log("Información de elementos multimedia:", mediaItemsInfo);
+        } catch (e) {
+          console.warn("Error al parsear mediaItemsInfo:", e);
+          mediaItemsInfo = [];
+        }
+      }
+      
+      // Si ya hay elementos multimedia en la base de datos, cargarlos
+      if (event.mediaItems) {
+        try {
+          mediaItems = JSON.parse(event.mediaItems);
+        } catch (e) {
+          console.warn("No se pudo parsear mediaItems del evento:", e);
+          // Inicializar como array vacío si hay error
+          mediaItems = [];
+        }
+      }
+      
+      // Verificar si el usuario quiere eliminar archivos existentes
+      if (req.body.resetMedia === 'true' || req.body.resetMedia === true) {
+        mediaItems = []; // Eliminar todos los archivos multimedia existentes
+        mainMediaUrl = ''; // Resetear el medio principal
+      }
+      
+      // Procesar elementos marcados para eliminar
+      const itemsToDelete = mediaItemsInfo.filter(info => info.url && (info.toDelete || info.deleted));
+      
+      if (itemsToDelete.length > 0) {
+        console.log(`Se encontraron ${itemsToDelete.length} elementos marcados para eliminar`);
+        
+        // Filtrar mediaItems para excluir los elementos marcados para eliminación
+        mediaItems = mediaItems.filter(item => {
+          // Verificar si este item coincide con alguno marcado para eliminar
+          const shouldDelete = itemsToDelete.some(
+            deleteItem => deleteItem.url === item.url && deleteItem.type === item.type
+          );
+          
+          // Si se va a eliminar el medio principal, resetear mainMediaUrl
+          if (shouldDelete && item.url === mainMediaUrl) {
+            console.log(`Eliminando el medio principal actual: ${item.url}`);
+            mainMediaUrl = '';
+            mainMediaType = 'photo'; // Default to photo to avoid enum error
+          }
+          
+          // Devolver true para mantener, false para eliminar
+          return !shouldDelete;
+        });
+        
+        console.log(`Quedan ${mediaItems.length} elementos multimedia después de eliminar los marcados`);
+      }
+      
+      // Si aún hay elementos multimedia después de las eliminaciones, 
+      // asegurarse de que haya un elemento principal si el anterior fue eliminado
+      if (mediaItems.length > 0 && !mainMediaUrl) {
+        // Buscar algún elemento marcado como principal
+        const mainItem = mediaItems.find(item => item.isMain);
+        
+        if (mainItem) {
+          // Usar el elemento que ya está marcado como principal
+          mainMediaUrl = mainItem.url;
+          mainMediaType = mainItem.type;
+          console.log(`Usando elemento marcado como principal: ${mainItem.url}`);
+        } else {
+          // Si no hay ninguno, usar el primer elemento disponible
+          mainMediaUrl = mediaItems[0].url;
+          mainMediaType = mediaItems[0].type;
+          mediaItems[0].isMain = true; // Marcar como principal
+          console.log(`Estableciendo nuevo elemento principal por defecto: ${mainMediaUrl}`);
+        }
+      }
+      
+      // Procesar la foto principal (mantener por compatibilidad)
+      if (files.eventPhoto && files.eventPhoto.length > 0) {
+        const photoPath = files.eventPhoto[0].path.replace('public', '');
+        updateData.photo_url = photoPath;
+        
+        // Añadir a mediaItems si no existe ya
+        if (!mediaItems.some(item => item.url === photoPath)) {
+          mediaItems.push({ type: 'photo', url: photoPath, order: mediaItems.length });
+        }
+        
+        // Si no hay media principal o se solicitó resetear, usar esta foto
+        if (!mainMediaUrl || req.body.resetMedia) {
+          mainMediaUrl = photoPath;
+          mainMediaType = 'photo';
+        }
+      }
+      
+      // Procesar el video principal (mantener por compatibilidad)
+      if (files.eventVideo && files.eventVideo.length > 0) {
+        const videoPath = files.eventVideo[0].path.replace('public', '');
+        updateData.video_url = videoPath;
+        
+        // Añadir a mediaItems si no existe ya
+        if (!mediaItems.some(item => item.url === videoPath)) {
+          mediaItems.push({ type: 'video', url: videoPath, order: mediaItems.length });
+        }
+      }
+      
+      // Procesar fotos adicionales (hasta 6 en total)
+      if (files.photos && files.photos.length > 0) {
+        const photoUrls = files.photos.map(file => file.path.replace('public', ''));
+        console.log(`Procesando ${photoUrls.length} nuevas fotos subidas`);
+        
+        // Buscar elementos marcados como principales en la información
+        // Tanto archivos existentes como nuevos
+        const mainPhotoInfo = mediaItemsInfo.find(info => 
+          info.isMain && info.isNew && info.type === 'photo'
+        );
+        
+        console.log("Info de fotos principales:", mainPhotoInfo ? JSON.stringify(mainPhotoInfo) : "ninguna");
+          
+        // Añadir a la lista de medios
+        photoUrls.forEach((url, index) => {
+          if (!mediaItems.some(item => item.url === url)) {
+            // Verificar si este elemento debe ser el principal
+            // Si se ha marcado explícitamente este archivo nuevo como principal
+            // o si no hay un medio principal definido y este es el primer elemento
+            let isPhotoMain = false;
+            
+            // Revisar si este archivo está marcado como principal en la info
+            if (mainPhotoInfo) {
+              // Compara el índice del archivo con el que está en la información
+              isPhotoMain = mainPhotoInfo.fileIndex === index;
+              console.log(`Verificando si foto ${index} es principal según mainPhotoInfo: ${isPhotoMain}`);
+            } else if (!mainMediaUrl && mediaItems.length === 0) {
+              // Si no hay principal definido, usar el primer elemento
+              isPhotoMain = true;
+              console.log(`Estableciendo foto ${index} como principal por defecto (primera foto)`);
+            }
+            
+            // Añadir el elemento a la lista
+            mediaItems.push({ 
+              type: 'photo', 
+              url, 
+              order: mediaItems.length, // Asignar orden secuencial
+              isMain: isPhotoMain
+            });
+            
+            // Si es principal, actualizar las variables de control
+            if (isPhotoMain) {
+              mainMediaUrl = url;
+              mainMediaType = 'photo';
+              console.log(`Estableciendo nueva foto subida como principal: ${url}`);
+              
+              // Asegurarse de que ningún otro elemento sea principal
+              mediaItems.forEach(item => {
+                if (item.url !== url) {
+                  item.isMain = false;
+                }
+              });
+            }
+          }
+        });
+        
+        // Si después de todo el proceso no hay un medio principal definido 
+        // y hay fotos nuevas, usar la primera foto como principal
+        if (!mainMediaUrl && photoUrls.length > 0) {
+          mainMediaUrl = photoUrls[0];
+          mainMediaType = 'photo';
+          
+          // Actualizar el indicador isMain en el array de medios
+          const firstPhotoIndex = mediaItems.findIndex(item => 
+            item.type === 'photo' && item.url === photoUrls[0]
+          );
+          
+          if (firstPhotoIndex >= 0) {
+            // Marcar el primer elemento como principal
+            mediaItems.forEach((item, idx) => {
+              item.isMain = idx === firstPhotoIndex;
+            });
+          }
+          
+          console.log(`Estableciendo nueva foto como principal (último recurso): ${mainMediaUrl}`);
+        }
+      }
+      
+      // Procesar videos adicionales (hasta 3 en total)
+      if (files.videos && files.videos.length > 0) {
+        const videoUrls = files.videos.map(file => file.path.replace('public', ''));
+        console.log(`Procesando ${videoUrls.length} nuevos videos subidos`);
+        
+        // Obtener información sobre cuál video debe ser el principal (si hay)
+        const mainVideoInfo = mediaItemsInfo.find(info => 
+          info.isMain && info.isNew && info.type === 'video'
+        );
+        
+        console.log("Info de videos principales:", mainVideoInfo ? JSON.stringify(mainVideoInfo) : "ninguna");
+        
+        // Añadir a la lista de medios
+        videoUrls.forEach((url, index) => {
+          if (!mediaItems.some(item => item.url === url)) {
+            // Verificar si este elemento debe ser el principal
+            let isVideoMain = false;
+            
+            // Revisar si este archivo está marcado como principal en la info
+            if (mainVideoInfo) {
+              // Compara el índice del archivo con el que está en la información
+              isVideoMain = mainVideoInfo.fileIndex === index;
+              console.log(`Verificando si video ${index} es principal según mainVideoInfo: ${isVideoMain}`);
+            } else if (!mainMediaUrl && mediaItems.length === 0) {
+              // Si no hay principal definido, usar el primer elemento
+              isVideoMain = true;
+              console.log(`Estableciendo video ${index} como principal por defecto (primer video)`);
+            }
+              
+            mediaItems.push({ 
+              type: 'video', 
+              url, 
+              order: mediaItems.length, // Asignar orden secuencial
+              isMain: isVideoMain
+            });
+            
+            // Si es principal, actualizar las variables de control
+            if (isVideoMain) {
+              mainMediaUrl = url;
+              mainMediaType = 'video';
+              console.log(`Estableciendo nuevo video subido como principal: ${url}`);
+              
+              // Asegurarse de que ningún otro elemento sea principal
+              mediaItems.forEach(item => {
+                if (item.url !== url) {
+                  item.isMain = false;
+                }
+              });
+            }
+          }
+        });
+        
+        // Si después de todo el proceso no hay un medio principal definido 
+        // y hay videos nuevos, usar el primer video como principal
+        if (!mainMediaUrl && videoUrls.length > 0) {
+          mainMediaUrl = videoUrls[0];
+          mainMediaType = 'video';
+          
+          // Actualizar el indicador isMain en el array de medios
+          const firstVideoIndex = mediaItems.findIndex(item => 
+            item.type === 'video' && item.url === videoUrls[0]
+          );
+          
+          if (firstVideoIndex >= 0) {
+            // Marcar el primer elemento como principal
+            mediaItems.forEach((item, idx) => {
+              item.isMain = idx === firstVideoIndex;
+            });
+          }
+          
+          console.log(`Estableciendo nuevo video como principal (último recurso): ${mainMediaUrl}`);
+        }
+      }
+      
+      // Procesar mediaItems JSON enviado directamente desde el cliente
+      if (req.body.mediaItems) {
+        try {
+          console.log("=== PROCESANDO MEDIA ITEMS DEL CLIENTE ===");
+          console.log("JSON recibido:", req.body.mediaItems);
+          
+          // Parsear el JSON enviado por el cliente
+          let clientMediaItems = [];
+          try {
+            clientMediaItems = JSON.parse(req.body.mediaItems);
+            console.log(`Elementos multimedia recibidos: ${clientMediaItems.length}`);
+            
+            // Procesar los archivos subidos y asignarlos a los elementos multimedia
+            if (files && Object.keys(files).length > 0) {
+              console.log("Archivos subidos detectados. Procesando...");
+              
+              // Obtener información de los nuevos elementos multimedia para pasar al procesador
+              const newMediaItemsInfo = mediaItemsInfo.filter(info => info.isNew || info.id?.startsWith('new-'));
+              console.log(`Elementos nuevos encontrados: ${newMediaItemsInfo.length}`);
+              
+              // Usar el helper para procesar los archivos subidos
+              const processingResult = processUploadedMedia(files, mediaItems, newMediaItemsInfo);
+              
+              // Actualizar variables con los resultados
+              mediaItems = processingResult.mediaItems;
+              
+              if (processingResult.mainMediaUrl) {
+                mainMediaUrl = processingResult.mainMediaUrl;
+                mainMediaType = processingResult.mainMediaType || 'photo';
+                console.log(`Media principal asignado: ${mainMediaType} - ${mainMediaUrl}`);
+              }
+              
+              // Actualizar los elementos del cliente con las URLs reales
+              for (const item of clientMediaItems) {
+                if (item.id && item.id.startsWith('new-')) {
+                  // Buscar el item correspondiente en mediaItemsInfo que ya fue procesado
+                  const processedItem = newMediaItemsInfo.find(info => info.id === item.id);
+                  if (processedItem && processedItem.url) {
+                    item.url = processedItem.url;
+                    console.log(`Actualizada URL para elemento ${item.id}: ${item.url}`);
+                  }
+                }
+              }
+            }
+          } catch (parseError) {
+            console.error("Error al parsear mediaItems:", parseError);
+            clientMediaItems = [];
+          }
+          
+          // DETECCIÓN DE PROBLEMA CRÍTICO: Verificar si hay medios existentes y el cliente envía array vacío
+          // Este es un patrón común cuando se edita el evento modificando sólo campos básicos
+          let preservingExistingMedia = false;
+          
+          // MEJORA: Usar la detección de archivos nuevos realizada antes
+          // y verificar si hay elementos nuevos (que aún no tienen URL pero tienen fileIndex o isNew)
+          const clientHasNewItems = Array.isArray(clientMediaItems) && 
+                                 clientMediaItems.some((item: any) => 
+                                   item && (item.isNew === true || item.fileIndex !== undefined));
+          
+          console.log("¿Hay archivos nuevos en la solicitud?", hasNewMediaFiles);
+          console.log("¿El cliente envía elementos nuevos?", clientHasNewItems);
+          
+          // Solo preservar medios existentes si no hay archivos nuevos y no hay elementos nuevos en clientMediaItems
+          if (mediaItems.length > 0 && 
+              !hasNewMediaFiles && 
+              !clientHasNewItems &&
+              (clientMediaItems.length === 0 || 
+               !clientMediaItems.some((item: any) => item && item.url))) {
+            
+            console.log("⚠️ CASO ESPECIAL DETECTADO: El cliente envió un array vacío o sin elementos válidos");
+            console.log(`⚠️ El evento ya tiene ${mediaItems.length} elementos multimedia existentes`);
+            console.log("🔒 PRESERVANDO los elementos multimedia existentes:");
+            console.log(JSON.stringify(mediaItems));
+            
+            // IMPORTANTE: Marcar que estamos preservando medios existentes
+            preservingExistingMedia = true;
+            
+            // Asegurar que haya un elemento principal
+            const currentMainItem = mediaItems.find(item => item.isMain);
+            if (!currentMainItem && mediaItems.length > 0) {
+              // Si no hay un elemento principal, establecer el primero como principal
+              mediaItems[0].isMain = true;
+              mainMediaUrl = mediaItems[0].url;
+              mainMediaType = mediaItems[0].type;
+              console.log(`✅ Estableciendo primer elemento como principal: ${mainMediaType} - ${mainMediaUrl}`);
+            } else if (currentMainItem) {
+              // Asegurar que las variables principales estén sincronizadas
+              mainMediaUrl = currentMainItem.url;
+              mainMediaType = currentMainItem.type;
+              console.log(`✅ Sincronizando con elemento principal existente: ${mainMediaType} - ${mainMediaUrl}`);
+            }
+            
+            // GUARDAR LOS MEDIA ITEMS PRESERVADOS EN EL OBJETO DE ACTUALIZACIÓN
+            updateData.mediaItems = JSON.stringify(mediaItems);
+            updateData.mainMediaUrl = mainMediaUrl;
+            updateData.mainMediaType = mainMediaType;
+            console.log("🔐 Guardando medios preservados en datos de actualización:", {
+              mediaItemsCount: mediaItems.length,
+              mainMediaUrl,
+              mainMediaType
+            });
+          }
+          
+          // Solo procesar los mediaItems del cliente si no estamos preservando los existentes
+          if (!preservingExistingMedia && Array.isArray(clientMediaItems)) {
+            try {
+              // MEJORA CRÍTICA: Verificar primero si hay un elemento explícitamente marcado como principal
+              const explicitMainItem = clientMediaItems.find((item: any) => 
+                item && item.isMain === true && !item.toDelete && !item.deleted
+              );
+              
+              if (explicitMainItem) {
+                console.log("DETECTADO ELEMENTO EXPLÍCITAMENTE MARCADO COMO PRINCIPAL:", {
+                  tipo: explicitMainItem.type || "desconocido",
+                  url: explicitMainItem.url || "sin URL"
+                });
+              } else {
+                console.log("No se encontró un elemento explícitamente marcado como principal");
+              }
+              // PASO 1: Identificar elementos explícitamente marcados para eliminación
+              const itemsToDelete = clientMediaItems
+                .filter((item: any) => {
+                  // Verificar cada item minuciosamente
+                  if (!item || !item.url) return false;
+                  
+                  // Comprobar si está marcado explícitamente para eliminar
+                  const markedForDeletion = item.toDelete === true || item.deleted === true;
+                  
+                  // Registrar cada elemento marcado para eliminar
+                  if (markedForDeletion) {
+                    console.log(`Elemento marcado para eliminación: ${item.type} - ${item.url}`);
+                  }
+                  
+                  return markedForDeletion;
+                });
+                
+                // Registrar cuántos elementos se marcarán para eliminación
+                if (itemsToDelete.length > 0) {
+                  console.log(`Se han marcado ${itemsToDelete.length} elementos para eliminación`);
+                }
+                
+                // Lista de URLs a eliminar para filtrado más sencillo
+                const urlsToDelete = itemsToDelete.map((item: any) => item.url);
+                console.log(`URLs a eliminar: [${urlsToDelete.join(', ')}]`);
+                
+                // Guardar una copia de los mediaItems actuales antes de procesarlos
+                // Esto nos permitirá preservar los que son nuevos subidos en esta misma petición
+                const existingMediaItems = [...mediaItems];
+                
+                // Crear un nuevo array para almacenar los mediaItems actualizados
+                const updatedMediaItems: MediaItem[] = [];
+                
+                // Lista de URLs de elementos que vienen del cliente para evitar duplicados
+                const clientUrls = clientMediaItems
+                  .filter((item: any) => item && item.url && !item.toDelete && !item.deleted)
+                  .map((item: any) => item.url);
+                
+                // Primero, agregar los archivos recién subidos que no están en el mediaItems del cliente
+                // y que no están marcados para eliminación
+                const newlyUploadedItems = existingMediaItems.filter(item => 
+                  !clientUrls.includes(item.url) && !urlsToDelete.includes(item.url));
+                
+                if (newlyUploadedItems.length > 0) {
+                  console.log(`Preservando ${newlyUploadedItems.length} elementos recién subidos que no están en mediaItems del cliente`);
+                  updatedMediaItems.push(...newlyUploadedItems);
+                }
+                
+                // MEJORA: Verificar si algún elemento del cliente está marcado como principal
+                const hasClientMainItem = clientMediaItems.some((item: any) => 
+                  item && item.isMain === true && !item.toDelete && !item.deleted
+                );
+                
+                console.log("¿Hay un elemento principal explícito en mediaItems del cliente?", hasClientMainItem);
+                
+                // Procesar los elementos enviados por el cliente
+                clientMediaItems.forEach((item: { 
+                  type: string; 
+                  url?: string; 
+                  isMain?: boolean;
+                  order?: number; 
+                  toDelete?: boolean;
+                  deleted?: boolean;
+                }, index: number) => {
+                  // Verificar si el elemento está marcado para eliminación
+                  const shouldRemove = item.toDelete === true || item.deleted === true;
+                  
+                  // Solo procesar elementos que no están marcados para eliminación y tienen URL
+                  if (item.url && !shouldRemove) {
+                    // MEJORA: Mantener el flag isMain exactamente como viene del cliente
+                    // sin normalizar a booleano en este punto para preservar mejor la selección
+                    const mediaItem = {
+                      type: item.type || 'photo',
+                      url: item.url,
+                      order: item.order !== undefined ? item.order : index + newlyUploadedItems.length,
+                      isMain: item.isMain === true  // Preservar la selección explícita
+                    };
+                    
+                    // Agregar al array de mediaItems
+                    updatedMediaItems.push(mediaItem);
+                    
+                    // Si este ítem está marcado como principal, actualizar los valores principales
+                    if (item.isMain === true) {
+                      mainMediaUrl = item.url;
+                      mainMediaType = item.type || 'photo';
+                      console.log(`Estableciendo media principal desde cliente: ${mainMediaType} - ${mainMediaUrl}`);
+                    }
+                  } else if (item.url && shouldRemove) {
+                    console.log(`ELIMINANDO elemento: ${item.type} - ${item.url}`);
+                    
+                    // Si el elemento eliminado era el principal, registrarlo
+                    if (item.isMain) {
+                      console.log(`¡ATENCIÓN! Se está eliminando el elemento principal: ${item.url}`);
+                    }
+                  }
+                });
+                
+                // Actualizar mediaItems con los elementos que han sido procesados (excluyendo los eliminados)
+                mediaItems = updatedMediaItems;
+            } catch (processingError) {
+              console.error("Error al procesar mediaItems del cliente:", processingError);
+            }
+          }
+        } catch (error) {
+          console.error("Error al procesar mediaItems JSON:", error);
+        }
+      }
+      
+      // Verificar si mainMediaUrl sigue siendo válido (podría haber sido eliminado)
+      if (mainMediaUrl) {
+        const mainMediaExists = mediaItems.some(item => item.url === mainMediaUrl);
+        if (!mainMediaExists) {
+          console.log(`El media principal ${mainMediaUrl} ya no existe, estableciendo uno nuevo`);
+          
+          // Intentar encontrar un nuevo elemento principal (preferiblemente foto)
+          const firstPhoto = mediaItems.find(item => item.type === 'photo');
+          if (firstPhoto) {
+            mainMediaUrl = firstPhoto.url;
+            mainMediaType = 'photo';
+            
+            // Actualizar la propiedad isMain en los elementos
+            mediaItems.forEach(item => {
+              item.isMain = item.url === mainMediaUrl;
+            });
+            
+            console.log(`Nuevo media principal establecido: ${mainMediaType} - ${mainMediaUrl}`);
+          } else if (mediaItems.length > 0) {
+            // Si no hay fotos, usar el primer elemento disponible
+            mainMediaUrl = mediaItems[0].url;
+            mainMediaType = mediaItems[0].type;
+            mediaItems[0].isMain = true;
+            
+            console.log(`Nuevo media principal (no foto) establecido: ${mainMediaType} - ${mainMediaUrl}`);
+          } else {
+            // No hay elementos multimedia
+            mainMediaUrl = '';
+            mainMediaType = 'photo'; // Default to photo to avoid enum error
+            console.log('No hay elementos multimedia disponibles para establecer como principal');
+          }
+        }
+      }
+      
+      console.log(`Procesados ${mediaItems.length} elementos multimedia en total (incluidos archivos nuevos)`);
+      
+      // Procesar el archivo principal especificado (subido como archivo)
+      if (files.mainMediaFile && files.mainMediaFile.length > 0) {
+        const mediaPath = files.mainMediaFile[0].path.replace('public', '');
+        // Determinar tipo según el mimetype
+        const isVideo = files.mainMediaFile[0].mimetype.startsWith('video/');
+        mainMediaType = isVideo ? 'video' : 'photo';
+        mainMediaUrl = mediaPath;
+        
+        console.log(`Archivo principal subido: ${mainMediaType} - ${mainMediaUrl}`);
+        
+        // Asegurarse de que está en mediaItems
+        if (!mediaItems.some(item => item.url === mediaPath)) {
+          // Crear un nuevo elemento multimedia para el archivo principal
+          const mainMediaItem = { 
+            type: mainMediaType, 
+            url: mediaPath, 
+            order: mediaItems.length,
+            isMain: true
+          };
+          
+          // Agregarlo a mediaItems
+          mediaItems.push(mainMediaItem);
+          console.log(`Agregado nuevo archivo principal a mediaItems: ${mainMediaType} - ${mediaPath}`);
+        } else {
+          // Actualizar el elemento existente para marcarlo como principal
+          // Mantenemos todos los demás elementos, pero actualizamos el isMain
+          mediaItems = mediaItems.map(item => ({
+            ...item,
+            isMain: item.url === mediaPath,
+            // Asegurar que el tipo coincida si es el elemento principal
+            type: item.url === mediaPath ? mainMediaType : item.type
+          }));
+          console.log(`Actualizado elemento existente como principal: ${mainMediaType} - ${mediaPath}`);
+        }
+      } else if (req.body.mainMediaUrl) {
+        // Permitir establecer un medio existente como principal
+        mainMediaUrl = req.body.mainMediaUrl;
+        mainMediaType = req.body.mainMediaType || 'photo';
+        
+        console.log(`Estableciendo medio existente como principal: ${mainMediaType} - ${mainMediaUrl}`);
+        
+        // Actualizar mediaItems para reflejar el cambio de elemento principal
+        mediaItems = mediaItems.map(item => ({
+          ...item,
+          isMain: item.url === mainMediaUrl,
+          // Asegurar que el tipo coincida si es el elemento principal
+          type: item.url === mainMediaUrl ? mainMediaType : item.type
+        }));
+      }
+      
+      // Verificar coherencia: asegurar que si hay mainMediaUrl, también hay mainMediaType
+      if (mainMediaUrl && !mainMediaType) {
+        // Determinar el tipo basado en la extensión del archivo
+        const isVideoExt = /\.(mp4|mov|avi|wmv|flv|webm)$/i.test(mainMediaUrl);
+        mainMediaType = isVideoExt ? 'video' : 'photo';
+        console.log(`Corrigiendo tipo de medio principal: ${mainMediaType} para ${mainMediaUrl}`);
+      }
+      
+      // Y viceversa: si no hay URL principal, no debería haber tipo
+      if (!mainMediaUrl && mainMediaType) {
+        console.log(`Corrigiendo inconsistencia: mainMediaType establecido (${mainMediaType}) pero no hay mainMediaUrl`);
+        
+        // Si hay al menos un elemento multimedia, usar el primero como principal
+        if (mediaItems.length > 0) {
+          // Buscar algún elemento que ya esté marcado como principal
+          const mainItem = mediaItems.find(item => item.isMain === true);
+          
+          if (mainItem) {
+            // Usar el elemento marcado como principal
+            mainMediaUrl = mainItem.url;
+            mainMediaType = mainItem.type;
+            console.log(`Usando elemento marcado como principal: ${mainMediaType} - ${mainMediaUrl}`);
+          } else {
+            // Si ninguno está marcado, usar el primero
+            mainMediaUrl = mediaItems[0].url;
+            mainMediaType = mediaItems[0].type;
+            console.log(`Usando primer elemento como principal: ${mainMediaType} - ${mainMediaUrl}`);
+            
+            // Actualizar el isMain en mediaItems
+            mediaItems = mediaItems.map((item, index) => ({
+              ...item,
+              isMain: index === 0
+            }));
+          }
+        } else {
+          // No hay elementos multimedia, usamos un tipo por defecto para evitar errores de enum
+          mainMediaType = 'photo'; // Default to photo to avoid enum error
+        }
+      }
+      
+      // Reorganizar elementos basados en el campo order
+      mediaItems.sort((a, b) => {
+        // Si el orden no está definido, considerar como último
+        const orderA = a.order !== undefined ? a.order : Number.MAX_SAFE_INTEGER;
+        const orderB = b.order !== undefined ? b.order : Number.MAX_SAFE_INTEGER;
+        return orderA - orderB;
+      });
+      
+      // Reasignar órdenes para asegurar consistencia
+      mediaItems = mediaItems.map((item, index) => ({
+        ...item,
+        order: index
+      }));
+      
+      // Asegurarse de que exactamente un elemento esté marcado como principal
+      const principalItems = mediaItems.filter(item => item.isMain === true);
+      
+      if (principalItems.length === 0 && mediaItems.length > 0) {
+        // Si ninguno está marcado como principal, intentar encontrar una foto primero
+        const firstPhoto = mediaItems.find(item => item.type === 'photo');
+        
+        if (firstPhoto) {
+          // Preferir una foto como elemento principal
+          firstPhoto.isMain = true;
+          mainMediaUrl = firstPhoto.url;
+          mainMediaType = 'photo';
+          console.log(`Estableciendo primera foto como principal por defecto: ${mainMediaUrl}`);
+        } else {
+          // Si no hay fotos, usar el primer elemento (probablemente un video)
+          mediaItems[0].isMain = true;
+          mainMediaUrl = mediaItems[0].url;
+          mainMediaType = mediaItems[0].type;
+          console.log(`Estableciendo el primer elemento como principal por defecto: ${mainMediaType} - ${mainMediaUrl}`);
+        }
+      } else if (principalItems.length > 1) {
+        // Si hay más de uno marcado como principal, dejar solo el primero
+        let foundMain = false;
+        mediaItems = mediaItems.map(item => {
+          if (item.isMain && !foundMain) {
+            foundMain = true;
+            // Asegurar que mainMediaUrl y mainMediaType están actualizados
+            mainMediaUrl = item.url;
+            mainMediaType = item.type;
+            return item;
+          }
+          return { ...item, isMain: false };
+        });
+        console.log(`Resolviendo múltiples principales: único elemento principal ahora es ${mainMediaType} - ${mainMediaUrl}`);
+      }
+      
+      // Limitar a máximo 6 fotos y 3 videos y preservar el elemento principal
+      const MAX_PHOTOS = 6;
+      const MAX_VIDEOS = 3;
+      
+      // Separar fotos y videos, y mantener referencia a cual es el elemento principal
+      const mainItem = mediaItems.find(item => item.isMain === true);
+      const photos = mediaItems.filter(item => item.type === 'photo');
+      const videos = mediaItems.filter(item => item.type === 'video');
+      
+      let photosToKeep = photos;
+      let videosToKeep = videos;
+      
+      // Limitar fotos si exceden el máximo
+      if (photos.length > MAX_PHOTOS) {
+        console.log(`Limitando cantidad de fotos: ${photos.length} → ${MAX_PHOTOS}`);
+        
+        // Si el elemento principal es una foto, asegurarse de que esté entre las que se mantienen
+        if (mainItem && mainItem.type === 'photo') {
+          // Quitar el elemento principal del array para no contarlo en el límite
+          const otherPhotos = photos.filter(item => item !== mainItem);
+          
+          // Mantener el elemento principal + hasta (MAX_PHOTOS-1) otras fotos
+          const remainingPhotos = otherPhotos.slice(0, MAX_PHOTOS - 1);
+          photosToKeep = [mainItem, ...remainingPhotos];
+        } else {
+          // Si no hay principal o no es una foto, simplemente mantener las primeras MAX_PHOTOS
+          photosToKeep = photos.slice(0, MAX_PHOTOS);
+        }
+      }
+      
+      // Limitar videos si exceden el máximo
+      if (videos.length > MAX_VIDEOS) {
+        console.log(`Limitando cantidad de videos: ${videos.length} → ${MAX_VIDEOS}`);
+        
+        // Si el elemento principal es un video, asegurarse de que esté entre los que se mantienen
+        if (mainItem && mainItem.type === 'video') {
+          // Quitar el elemento principal del array para no contarlo en el límite
+          const otherVideos = videos.filter(item => item !== mainItem);
+          
+          // Mantener el elemento principal + hasta (MAX_VIDEOS-1) otros videos
+          const remainingVideos = otherVideos.slice(0, MAX_VIDEOS - 1);
+          videosToKeep = [mainItem, ...remainingVideos];
+        } else {
+          // Si no hay principal o no es un video, simplemente mantener los primeros MAX_VIDEOS
+          videosToKeep = videos.slice(0, MAX_VIDEOS);
+        }
+      }
+      
+      // Asignar los elementos filtrados y reordenar
+      mediaItems = [...photosToKeep, ...videosToKeep];
+      
+      // Verificar si el elemento principal se conservó después de la filtración
+      if (mainItem && !mediaItems.includes(mainItem)) {
+        console.warn("El elemento principal se perdió durante la filtración. Asignando uno nuevo.");
+        
+        // Si el elemento principal se perdió, asignar uno nuevo
+        if (mediaItems.length > 0) {
+          // Preferir fotos como elemento principal
+          const newMainItem = mediaItems.find(item => item.type === 'photo') || mediaItems[0];
+          
+          // Actualizar flags y variables
+          mediaItems = mediaItems.map(item => ({
+            ...item,
+            isMain: item === newMainItem
+          }));
+          
+          mainMediaUrl = newMainItem.url;
+          mainMediaType = newMainItem.type;
+          
+          console.log(`Nuevo elemento principal asignado: ${mainMediaType} - ${mainMediaUrl}`);
+        } else {
+          // No hay elementos multimedia después de la filtración
+          mainMediaUrl = '';
+          mainMediaType = 'photo'; // Default to photo to avoid enum error
+        }
+      }
+      
+      // Re-asignar órdenes para mantener consistencia después de filtrar
+      mediaItems = mediaItems.map((item, index) => ({
+        ...item,
+        order: index
+      }));
+      
+      // Verificar si estamos preservando medios (variable global declarada anteriormente)
+      const isPreservingMedia = updateData.mediaItems !== undefined && 
+                               typeof updateData.mediaItems === 'string' &&
+                               updateData.mediaItems.length > 2; // Al menos "[]"
+      
+      // Actualizar los campos de multimedia SOLO si no estamos preservando medios
+      if (!isPreservingMedia) {
+        console.log("Actualizando datos multimedia normalmente (no preservando)");
+        updateData.mediaItems = JSON.stringify(mediaItems);
+        
+        // Asegurar que mainMediaType sea siempre un string, no un array
+        if (Array.isArray(mainMediaType)) {
+          updateData.mainMediaType = mainMediaType[0] || 'photo';
+          console.log(`Corrigiendo mainMediaType de array a string: ${mainMediaType} → ${updateData.mainMediaType}`);
+        } else {
+          updateData.mainMediaType = mainMediaType || 'photo';
+        }
+        
+        updateData.mainMediaUrl = mainMediaUrl;
+      } else {
+        // Si estamos preservando medios, ya se guardaron en updateData anteriormente
+        console.log("PRESERVACIÓN: Saltando actualización estándar de medios");
+        console.log("MediaItems preservados:", updateData.mediaItems);
+      }
+      
+      // Si hay preguntas de postulación, incluirlas
+      if (req.body.applicationQuestions) {
+        updateData.applicationQuestions = req.body.applicationQuestions;
+      }
+      
+      // Update event
+      const updatedEvent = await storage.updateEvent(eventId, updateData);
+      
+      // Broadcast event update to all connected clients
+      broadcastMessage({
+        type: 'event_updated',
+        event: updatedEvent
+      });
+      console.log("Notificación de actualización de evento enviada a todos los clientes WebSocket");
+      
+      res.json(updatedEvent);
+    } catch (error) {
+      console.error("Error updating event with files:", error);
+      res.status(500).json({ message: "Error updating event", error: String(error) });
+    }
+  });
+
+  app.delete("/api/events/:id", isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      const eventId = parseInt(req.params.id);
+      
+      // Check if event exists
+      const event = await storage.getEventById(eventId);
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+      
+      // Check if user is the organizer
+      if (event.organizerId !== user.id) {
+        return res.status(403).json({ message: "Not authorized to delete this event" });
+      }
+      
+      // Delete event
+      await storage.deleteEvent(eventId);
+      res.json({ message: "Event deleted successfully" });
+    } catch (error) {
+      console.error("Error deleting event:", error);
+      res.status(500).json({ message: "Error deleting event" });
+    }
+  });
+
+  // Event attendance routes
+  app.post("/api/events/:id/join", isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      const eventId = parseInt(req.params.id);
+      
+      // Check if event exists
+      const event = await storage.getEventById(eventId);
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+      
+      // Check if user is already attending
+      const existingAttendee = await storage.getEventAttendee(eventId, user.id);
+      if (existingAttendee) {
+        return res.status(400).json({ 
+          message: "Already joined this event",
+          status: existingAttendee.status
+        });
+      }
+      
+      // Check if event is at capacity
+      if (event.maxCapacity) {
+        const attendees = await storage.getEventAttendees(eventId);
+        if (attendees.length >= event.maxCapacity) {
+          return res.status(400).json({ message: "Event is at maximum capacity" });
+        }
+      }
+      
+      // For private events, create a pending request
+      if (event.privacyType === 'private') {
+        const attendee = await storage.joinEvent({
+          eventId,
+          userId: user.id,
+          status: 'pending',
+          paymentStatus: event.paymentType === 'free' ? 'completed' : 'pending'
+        });
+        
+        return res.status(201).json({ 
+          attendee, 
+          requiresPayment: false,
+          isPendingApproval: true
+        });
+      }
+      
+      // For paid events, process through Stripe
+      if (event.paymentType === 'paid' && event.price) {
+        if (!stripe) {
+          return res.status(500).json({ message: "Payment processing is not available" });
+        }
+        
+        // Pagos desactivados, creamos un objeto simulado para mantener compatibilidad con el código
+        const paymentIntent = {
+          id: `free_event_${Date.now()}`,
+          client_secret: `free_event_no_payment_required_${Date.now()}`
+        };
+        
+        // Create attendance record with pending payment
+        const attendee = await storage.joinEvent({
+          eventId,
+          userId: user.id,
+          status: 'approved',
+          paymentStatus: 'pending',
+          paymentIntentId: paymentIntent.id
+        });
+        
+        return res.status(201).json({ 
+          attendee,
+          clientSecret: paymentIntent.client_secret,
+          requiresPayment: true,
+          isPendingApproval: false
+        });
+      }
+      
+      // For free events, just add them
+      const attendee = await storage.joinEvent({
+        eventId,
+        userId: user.id,
+        status: 'approved',
+        paymentStatus: 'completed'
+      });
+      
+      res.status(201).json({ 
+        attendee, 
+        requiresPayment: false,
+        isPendingApproval: false
+      });
+    } catch (error) {
+      console.error("Error joining event:", error);
+      res.status(500).json({ message: "Error joining event" });
+    }
+  });
+
+  app.delete("/api/events/:id/leave", isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      const eventId = parseInt(req.params.id);
+      
+      // Check if user is attending
+      const attendee = await storage.getEventAttendee(eventId, user.id);
+      if (!attendee) {
+        return res.status(404).json({ message: "Not attending this event" });
+      }
+      
+      // Cannot leave a paid event if payment is completed
+      if (attendee.paymentStatus === 'completed' && attendee.paymentIntentId) {
+        return res.status(400).json({ message: "Cannot leave a paid event after payment is completed" });
+      }
+      
+      // Pagos desactivados, no necesitamos cancelar el payment intent
+      // Si hubiera pagos, aquí se cancelaría el payment intent
+      
+      // Remove attendee record
+      await storage.leaveEvent(eventId, user.id);
+      res.json({ message: "Left event successfully" });
+    } catch (error) {
+      console.error("Error leaving event:", error);
+      res.status(500).json({ message: "Error leaving event" });
+    }
+  });
+  
+  // Approve/reject join requests for private events
+  app.post("/api/events/:id/requests/:attendeeId/approve", isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      const eventId = parseInt(req.params.id);
+      const attendeeId = parseInt(req.params.attendeeId);
+      
+      // Verify the event exists and user is the organizer
+      const event = await storage.getEventById(eventId);
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+      
+      if (event.organizerId !== user.id) {
+        return res.status(403).json({ message: "Only the event organizer can approve requests" });
+      }
+      
+      // Get the attendee record
+      const attendee = await storage.getEventAttendee(eventId, attendeeId);
+      if (!attendee) {
+        return res.status(404).json({ message: "Join request not found" });
+      }
+      
+      if (attendee.status !== 'pending') {
+        return res.status(400).json({ message: "This request has already been processed" });
+      }
+      
+      // Update attendee status
+      const updatedAttendee = await storage.updateEventAttendee(attendee.id, {
+        status: 'approved'
+      });
+      
+      res.json({ 
+        attendee: updatedAttendee,
+        message: "Join request approved" 
+      });
+    } catch (error) {
+      console.error("Error approving join request:", error);
+      res.status(500).json({ message: "Server error" });
+    }
+  });
+  
+  app.post("/api/events/:id/requests/:attendeeId/reject", isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      const eventId = parseInt(req.params.id);
+      const attendeeId = parseInt(req.params.attendeeId);
+      
+      // Verify the event exists and user is the organizer
+      const event = await storage.getEventById(eventId);
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+      
+      if (event.organizerId !== user.id) {
+        return res.status(403).json({ message: "Only the event organizer can reject requests" });
+      }
+      
+      // Get the attendee record
+      const attendee = await storage.getEventAttendee(eventId, attendeeId);
+      if (!attendee) {
+        return res.status(404).json({ message: "Join request not found" });
+      }
+      
+      if (attendee.status !== 'pending') {
+        return res.status(400).json({ message: "This request has already been processed" });
+      }
+      
+      // Delete the attendee record
+      await storage.leaveEvent(eventId, attendeeId);
+      
+      res.json({ message: "Join request rejected" });
+    } catch (error) {
+      console.error("Error rejecting join request:", error);
+      res.status(500).json({ message: "Server error" });
+    }
+  });
+  
+  // Get pending join requests for an event
+  app.get("/api/events/:id/requests", isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      const eventId = parseInt(req.params.id);
+      
+      // Verify the event exists and user is the organizer
+      const event = await storage.getEventById(eventId);
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+      
+      if (event.organizerId !== user.id) {
+        return res.status(403).json({ message: "Only the event organizer can view join requests" });
+      }
+      
+      // Get all attendees for the event
+      const attendees = await storage.getEventAttendees(eventId);
+      
+      // Filter to only pending requests
+      const pendingRequests = attendees.filter(attendee => attendee.status === 'pending');
+      
+      res.json(pendingRequests);
+    } catch (error) {
+      console.error("Error fetching join requests:", error);
+      res.status(500).json({ message: "Server error" });
+    }
+  });
+  
+  // Check user's status for an event (for pending requests)
+  app.get("/api/events/:id/status", isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      const eventId = parseInt(req.params.id);
+      
+      // Get user's attendance record
+      const attendee = await storage.getEventAttendee(eventId, user.id);
+      if (!attendee) {
+        return res.status(404).json({ 
+          message: "No estás registrado en este evento",
+          status: null
+        });
+      }
+      
+      // Return status
+      res.json({ 
+        status: attendee.status,
+        paymentStatus: attendee.paymentStatus
+      });
+    } catch (error) {
+      console.error("Error checking event status:", error);
+      res.status(500).json({ message: "Error del servidor" });
+    }
+  });
+
+  // Simplified payment routes - all events are free
+  app.post("/api/payment/confirm", isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      const { eventId } = req.body;
+      
+      // Check if the event exists
+      const event = await storage.getEventById(parseInt(eventId));
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+      
+      // Automatically join the event as free
+      try {
+        // Update the attendee record
+        const updatedAttendee = await storage.updatePaymentStatus(
+          parseInt(eventId),
+          user.id,
+          'free',
+          ""
+        );
+        
+        res.json(updatedAttendee);
+      } catch (error) {
+        console.error("Error updating event status:", error);
+        res.status(500).json({ message: "Error updating event attendance" });
+      }
+    } catch (error) {
+      console.error("Error joining event:", error);
+      res.status(500).json({ message: "Error joining event" });
+    }
+  });
+
+  // User events routes
+  app.get("/api/user/events/created", isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      const events = await storage.getUserCreatedEvents(user.id);
+      res.json(events);
+    } catch (error) {
+      console.error("Error fetching created events:", error);
+      res.status(500).json({ message: "Error fetching created events" });
+    }
+  });
+
+  app.get("/api/user/events/attending", isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      const events = await storage.getUserAttendingEvents(user.id);
+      res.json(events);
+    } catch (error) {
+      console.error("Error fetching attending events:", error);
+      res.status(500).json({ message: "Error fetching attending events" });
+    }
+  });
+
+  // Simplified payment intent route - all events are free
+  app.post("/api/create-payment-intent", isAuthenticated, async (req, res) => {
+    try {      
+      const { eventId } = req.body;
+      const user = req.user as any;
+      
+      // Get the event details
+      const event = await storage.getEventById(parseInt(eventId));
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+      
+      // Automatically join the event as a free event
+      try {
+        await storage.joinEvent({
+          eventId: parseInt(eventId),
+          userId: user.id,
+          paymentStatus: "free",
+          paymentIntentId: ""
+        });
+        
+        // Return a fake client secret to keep the client logic working
+        res.json({ 
+          clientSecret: "free_event_no_payment_required",
+          message: "Joined event successfully" 
+        });
+      } catch (error) {
+        console.error("Error joining event:", error);
+        res.status(500).json({ message: "Error joining event" });
+      }
+    } catch (error) {
+      console.error("Error handling free event join:", error);
+      res.status(500).json({ message: "Server error" });
+    }
+  });
+
+  const httpServer = createServer(app);
+  
+  // Initialize WebSocket server with Supabase Realtime integration
+  const wss = setupRealtimeWS(httpServer);
+
+  return httpServer;
+}
