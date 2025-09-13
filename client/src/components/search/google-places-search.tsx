@@ -366,17 +366,47 @@ const GooglePlacesSearch = ({
               {eventSuggestions.map((event) => (
                 <div
                   key={`event-${event.id}`}
-                  className="cursor-pointer flex items-center px-4 py-2 hover:bg-gray-100"
+                  className="cursor-pointer shadow-sm hover:bg-gray-50 transition-all duration-200 bg-white rounded-xl border border-gray-200 flex flex-row overflow-hidden h-[90px] mx-2 my-2"
                   onClick={() => handleEventSelect(event)}
                 >
-                  <div className="mr-2">
-                    <Calendar className="h-4 w-4 text-primary" />
+                  <div className="flex-shrink-0 w-24 h-[90px]">
+                    <div className="w-full h-full bg-gray-100 flex items-center justify-center rounded-l-xl overflow-hidden">
+                      {event.mainMediaUrl ? (
+                        <img 
+                          src={event.mainMediaUrl} 
+                          alt={event.title}
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <div className="text-lg">
+                          <Calendar className="h-6 w-6 text-primary" />
+                        </div>
+                      )}
+                    </div>
                   </div>
-                  <div className="flex flex-col">
-                    <span className="text-sm font-medium">{event.title}</span>
-                    <span className="text-xs text-gray-500 line-clamp-1">
-                      {event.locationName} • {new Date(event.date).toLocaleDateString()}
-                    </span>
+                  <div className="flex-1 min-w-0 p-3">
+                    <div className="text-xs font-semibold uppercase text-gray-500 mb-1">
+                      {event.category || 'EVENTO'}
+                    </div>
+                    <h3 className="font-bold text-sm truncate text-gray-800">
+                      {event.title}
+                    </h3>
+                    <p className="text-xs text-gray-600 truncate">
+                      {event.locationName}
+                    </p>
+                    <div className="flex items-center justify-between">
+                      <p className="text-xs text-gray-500">
+                        {new Date(event.date).toLocaleDateString(
+                          "es-ES",
+                          {
+                            month: "short",
+                            day: "numeric",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          },
+                        )}
+                      </p>
+                    </div>
                   </div>
                 </div>
               ))}
