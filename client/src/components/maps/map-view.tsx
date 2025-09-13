@@ -169,6 +169,9 @@ const MapView = ({
   setIsFocusedMode = () => {}, // Default a función vacía si no se provee
   overlaysHidden = false, // Default a false si no se provee
 }: MapViewProps) => {
+  // Unificar la lógica de visibilidad de overlays
+  const hideOverlays = overlaysHidden || isFocusedMode;
+  
   const { user } = useAuth(); // Obtener el usuario actual
   const [filtersVisible, setFiltersVisible] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
@@ -3295,8 +3298,8 @@ const MapView = ({
         )}
       </AnimatePresence>
 
-      {/* Search Bars - Ocultar en modo focalizado */}
-      {!isFocusedMode && (
+      {/* Search Bars - Ocultar cuando overlays están ocultos o en modo focalizado */}
+      {!hideOverlays && (
         <div className="absolute top-4 left-4 right-4 z-10 flex flex-col gap-2">
         {/* Barra de búsqueda principal con filtros */}
         <div className="flex items-center gap-2">
@@ -3461,8 +3464,9 @@ const MapView = ({
 
       {/* Solo mostramos el encabezado de selección sin la tarjeta de información */}
 
-      {/* Control buttons - map group (vertical layout) */}
-      <div className="absolute top-[90px] left-4 flex flex-col gap-3">
+      {/* Control buttons - map group (vertical layout) - Ocultar cuando overlays están ocultos o en modo focalizado */}
+      {!hideOverlays && (
+        <div className="absolute top-[90px] left-4 flex flex-col gap-3">
         {/* 3D/2D Toggle Button (Traditional Mapbox) */}
         {!isSnapMap3D && (
           <button
@@ -3501,7 +3505,8 @@ const MapView = ({
         >
           <MapPin size={22} />
         </button>
-      </div>
+        </div>
+      )}
 
       {/* Map Configuration Panel */}
       <MapConfigPanel
@@ -3520,8 +3525,8 @@ const MapView = ({
         is3DMode={is3DMode}
       />
 
-      {/* Main action buttons - Positioned above tab bar, ocultar en modo focalizado */}
-      {!isFocusedMode && (
+      {/* Main action buttons - Positioned above tab bar, ocultar cuando overlays están ocultos o en modo focalizado */}
+      {!hideOverlays && (
         <div className="absolute bottom-[120px] left-0 right-0 z-10 flex justify-center gap-4 px-6">
         {contextMenu.visible ? (
           // Botones cuando hay un menú contextual activo
