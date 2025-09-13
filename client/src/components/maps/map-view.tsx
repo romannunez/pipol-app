@@ -3507,7 +3507,7 @@ const MapView = ({
             title={is3DMode ? "Cambiar a vista 2D" : "Cambiar a vista 3D"}
             aria-label={is3DMode ? "Cambiar a vista 2D" : "Cambiar a vista 3D"}
           >
-            {is3DMode ? <Building2 size={22} /> : <Globe size={22} />}
+            <span className="text-sm font-semibold">{is3DMode ? "2D" : "3D"}</span>
           </button>
         )}
 
