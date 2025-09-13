@@ -1206,7 +1206,6 @@ const EventDetailSheet = ({
                 </div>
                 <div>
                   <p className="font-semibold text-neutral-800">Acerca de este evento</p>
-                  <p className="text-sm text-neutral-600">Información</p>
                 </div>
               </div>
               <div className="relative">
