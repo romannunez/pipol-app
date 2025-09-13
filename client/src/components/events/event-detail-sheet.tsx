@@ -1200,11 +1200,14 @@ const EventDetailSheet = ({
           {/* Event description - Enhanced version */}
           <div className="mb-6">
             <div className="bg-gradient-to-r from-neutral-50 to-neutral-100 p-5 rounded-2xl border border-neutral-200/60">
-              <div className="flex items-center gap-2 mb-3">
-                <div className="bg-primary/10 p-2 rounded-lg">
+              <div className="flex items-start gap-3 mb-3">
+                <div className="bg-white p-2 rounded-lg">
                   <span className="text-xl">👋</span>
                 </div>
-                <h3 className="font-bold text-lg text-neutral-800">Acerca de este evento</h3>
+                <div>
+                  <p className="font-semibold text-neutral-800">Acerca de este evento</p>
+                  <p className="text-sm text-neutral-600">Información</p>
+                </div>
               </div>
               <div className="relative">
                 <p className="text-neutral-700 leading-relaxed text-base whitespace-pre-wrap">
