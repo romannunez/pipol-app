@@ -1200,7 +1200,7 @@ const EventDetailSheet = ({
           {/* Event description - Enhanced version */}
           <div className="mb-6">
             <div className="bg-gradient-to-r from-neutral-50 to-neutral-100 p-5 rounded-2xl border border-neutral-200/60">
-              <div className="flex items-start gap-3 mb-3">
+              <div className="flex items-center gap-3 mb-3">
                 <div className="bg-white p-2 rounded-lg">
                   <span className="text-xl">👋</span>
                 </div>
