@@ -1,0 +1,171 @@
+        }
+      }
+      
+      // Procesar mediaItems JSON enviado directamente desde el cliente
+      if (req.body.mediaItems) {
+        try {
+          console.log("=== PROCESANDO MEDIA ITEMS DEL CLIENTE ===");
+          console.log("JSON recibido:", req.body.mediaItems);
+          
+          // Parsear el JSON enviado por el cliente
+          let clientMediaItems = [];
+          try {
+            clientMediaItems = JSON.parse(req.body.mediaItems);
+            console.log(`Elementos multimedia recibidos: ${clientMediaItems.length}`);
+          } catch (parseError) {
+            console.error("Error al parsear mediaItems:", parseError);
+            clientMediaItems = [];
+          }
+          
+          // DETECCIÓN DE PROBLEMA CRÍTICO: Verificar si hay medios existentes y el cliente envía array vacío
+          // Este es un patrón común cuando se edita el evento modificando sólo campos básicos
+          let preservingExistingMedia = false;
+          
+          if (mediaItems.length > 0 && 
+              (clientMediaItems.length === 0 || 
+               !clientMediaItems.some((item: any) => item && item.url))) {
+            
+            console.log("⚠️ CASO ESPECIAL DETECTADO: El cliente envió un array vacío o sin elementos válidos");
+            console.log(`⚠️ El evento ya tiene ${mediaItems.length} elementos multimedia existentes`);
+            console.log("🔒 PRESERVANDO los elementos multimedia existentes:");
+            console.log(JSON.stringify(mediaItems));
+            
+            // IMPORTANTE: Marcar que estamos preservando medios existentes
+            preservingExistingMedia = true;
+            
+            // Asegurar que haya un elemento principal
+            const currentMainItem = mediaItems.find(item => item.isMain);
+            if (!currentMainItem && mediaItems.length > 0) {
+              // Si no hay un elemento principal, establecer el primero como principal
+              mediaItems[0].isMain = true;
+              mainMediaUrl = mediaItems[0].url;
+              mainMediaType = mediaItems[0].type;
+              console.log(`✅ Estableciendo primer elemento como principal: ${mainMediaType} - ${mainMediaUrl}`);
+            } else if (currentMainItem) {
+              // Asegurar que las variables principales estén sincronizadas
+              mainMediaUrl = currentMainItem.url;
+              mainMediaType = currentMainItem.type;
+              console.log(`✅ Sincronizando con elemento principal existente: ${mainMediaType} - ${mainMediaUrl}`);
+            }
+          }
+          
+          // Solo procesar los mediaItems del cliente si no estamos preservando los existentes
+          if (!preservingExistingMedia && Array.isArray(clientMediaItems)) {
+            // MEJORA CRÍTICA: Verificar primero si hay un elemento explícitamente marcado como principal
+            const explicitMainItem = clientMediaItems.find((item: any) => 
+              item && item.isMain === true && !item.toDelete && !item.deleted
+            );
+            
+            if (explicitMainItem) {
+              console.log("DETECTADO ELEMENTO EXPLÍCITAMENTE MARCADO COMO PRINCIPAL:", {
+                tipo: explicitMainItem.type || "desconocido",
+                url: explicitMainItem.url || "sin URL"
+              });
+            } else {
+              console.log("No se encontró un elemento explícitamente marcado como principal");
+            }
+            // PASO 1: Identificar elementos explícitamente marcados para eliminación
+            const itemsToDelete = clientMediaItems
+              .filter((item: any) => {
+                // Verificar cada item minuciosamente
+                if (!item || !item.url) return false;
+                
+                // Comprobar si está marcado explícitamente para eliminar
+                const markedForDeletion = item.toDelete === true || item.deleted === true;
+                
+                // Registrar cada elemento marcado para eliminar
+                if (markedForDeletion) {
+                  console.log(`Elemento marcado para eliminación: ${item.type} - ${item.url}`);
+                }
+                
+                return markedForDeletion;
+              });
+              
+              // Registrar cuántos elementos se marcarán para eliminación
+              if (itemsToDelete.length > 0) {
+                console.log(`Se han marcado ${itemsToDelete.length} elementos para eliminación`);
+              }
+              
+              // Lista de URLs a eliminar para filtrado más sencillo
+              const urlsToDelete = itemsToDelete.map((item: any) => item.url);
+              console.log(`URLs a eliminar: [${urlsToDelete.join(', ')}]`);
+              
+              // Guardar una copia de los mediaItems actuales antes de procesarlos
+              // Esto nos permitirá preservar los que son nuevos subidos en esta misma petición
+              const existingMediaItems = [...mediaItems];
+              
+              // Crear un nuevo array para almacenar los mediaItems actualizados
+              const updatedMediaItems: MediaItem[] = [];
+              
+              // Lista de URLs de elementos que vienen del cliente para evitar duplicados
+              const clientUrls = clientMediaItems
+                .filter((item: any) => item && item.url && !item.toDelete && !item.deleted)
+                .map((item: any) => item.url);
+              
+              // Primero, agregar los archivos recién subidos que no están en el mediaItems del cliente
+              // y que no están marcados para eliminación
+              const newlyUploadedItems = existingMediaItems.filter(item => 
+                !clientUrls.includes(item.url) && !urlsToDelete.includes(item.url));
+              
+              if (newlyUploadedItems.length > 0) {
+                console.log(`Preservando ${newlyUploadedItems.length} elementos recién subidos que no están en mediaItems del cliente`);
+                updatedMediaItems.push(...newlyUploadedItems);
+              }
+              
+              // MEJORA: Verificar si algún elemento del cliente está marcado como principal
+              const hasClientMainItem = clientMediaItems.some((item: any) => 
+                item && item.isMain === true && !item.toDelete && !item.deleted
+              );
+              
+              console.log("¿Hay un elemento principal explícito en mediaItems del cliente?", hasClientMainItem);
+              
+              // Procesar los elementos enviados por el cliente
+              clientMediaItems.forEach((item: { 
+                type: string; 
+                url?: string; 
+                isMain?: boolean;
+                order?: number; 
+                toDelete?: boolean;
+                deleted?: boolean;
+              }, index: number) => {
+                // Verificar si el elemento está marcado para eliminación
+                const shouldRemove = item.toDelete === true || item.deleted === true;
+                
+                // Solo procesar elementos que no están marcados para eliminación y tienen URL
+                if (item.url && !shouldRemove) {
+                  // MEJORA: Mantener el flag isMain exactamente como viene del cliente
+                  // sin normalizar a booleano en este punto para preservar mejor la selección
+                  const mediaItem = {
+                    type: item.type || 'photo',
+                    url: item.url,
+                    order: item.order !== undefined ? item.order : index + newlyUploadedItems.length,
+                    isMain: item.isMain === true  // Preservar la selección explícita
+                  };
+                  
+                  // Agregar al array de mediaItems
+                  updatedMediaItems.push(mediaItem);
+                  
+                  // Si este ítem está marcado como principal, actualizar los valores principales
+                  if (item.isMain === true) {
+                    mainMediaUrl = item.url;
+                    mainMediaType = item.type || 'photo';
+                    console.log(`Estableciendo media principal desde cliente: ${mainMediaType} - ${mainMediaUrl}`);
+                  }
+                } else if (item.url && shouldRemove) {
+                  console.log(`ELIMINANDO elemento: ${item.type} - ${item.url}`);
+                  
+                  // Si el elemento eliminado era el principal, registrarlo
+                  if (item.isMain) {
+                    console.log(`¡ATENCIÓN! Se está eliminando el elemento principal: ${item.url}`);
+                  }
+                }
+              });
+              
+              // Actualizar mediaItems con los elementos que han sido procesados (excluyendo los eliminados)
+              mediaItems = updatedMediaItems;
+            }
+          }
+        } catch (error) {
+          console.error("Error al procesar mediaItems JSON:", error);
+        }
+      }

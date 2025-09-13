@@ -1,0 +1,1930 @@
+import React, { useState, useEffect, useRef } from "react";
+import SearchBar from "@/components/search/search-bar";
+import GooglePlacesSearch from "@/components/search/google-places-search";
+import EventFilters from "@/components/events/event-filters";
+import { Circle, MapPin, MapIcon, PinIcon, Plus, Pin, MapPinned, Check, X, Compass, Filter } from "lucide-react";
+import { useToast } from "@/hooks/use-toast";
+import { useQuery } from "@tanstack/react-query";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import EventPin from "./event-pin";
+import { CategoryPin } from "./category-icons";
+import mapboxgl, { LngLat } from 'mapbox-gl';
+import { initializeMap, getUserLocation, defaultMapConfig, searchLocations, reverseGeocode } from "@/lib/mapbox";
+// Para debugging - importar también funciones de google
+import { reverseGeocode as googleReverseGeocode, findNearbyPlaces } from "@/lib/google-maps";
+import { createRoot } from 'react-dom/client';
+
+// Import required types
+type Event = {
+  id: number;
+  title: string;
+  description: string;
+  category: string;
+  date: string;
+  latitude: string | number;
+  longitude: string | number;
+  locationName: string;
+  locationAddress: string;
+  paymentType: string;
+  price?: string | number;
+  maxCapacity?: number;
+  privacyType: string;
+  organizerId: number;
+  organizer: {
+    id: number;
+    name: string;
+    avatar?: string;
+  };
+  attendees: Array<{
+    id: number;
+    user: {
+      id: number;
+      name: string;
+      avatar?: string;
+    };
+  }>;
+};
+
+type MapViewProps = {
+  onEventSelect: (event: Event) => void;
+  onCreateEventClick: (locationData?: { 
+    latitude: number, 
+    longitude: number, 
+    locationAddress: string, 
+    locationName: string 
+  }) => void;
+  filters?: {
+    category?: string[];
+    paymentType?: string[];
+    date?: string;
+  };
+  resetLocationOnFormClose?: boolean;
+};
+
+
+
+const MapView = ({ onEventSelect, onCreateEventClick, filters, resetLocationOnFormClose }: MapViewProps) => {
+  const [filtersVisible, setFiltersVisible] = useState(false);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [locationMode, setLocationMode] = useState(false);
+  const [eventsPanelVisible, setEventsPanelVisible] = useState(false);
+  const [tempLocationMarker, setTempLocationMarker] = useState<mapboxgl.Marker | null>(null);
+  const [tempLocationData, setTempLocationData] = useState<{
+    latitude: number;
+    longitude: number;
+    locationAddress: string;
+    locationName: string;
+  } | null>(null);
+  
+  // Estado para mostrar botones de acción en ubicación actual
+  const [showActionsForLocation, setShowActionsForLocation] = useState(false);
+  
+  // Estado para guardar las coordenadas y datos de la ubicación actual del mapa
+  const [currentLocation, setCurrentLocation] = useState<{
+    lng: number;
+    lat: number;
+    locationName?: string;
+    locationAddress?: string;
+  } | null>(null);
+  
+  // Estado para guardar eventos filtrados por una ubicación específica
+  const [locationFilteredEvents, setLocationFilteredEvents] = useState<Event[]>([]);
+  
+  const { toast } = useToast();
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<mapboxgl.Map | null>(null);
+  const markersRef = useRef<mapboxgl.Marker[]>([]);
+  const popupsRef = useRef<mapboxgl.Popup[]>([]);
+  
+  // Fetch events from API
+  const { data: eventsData, isLoading, error } = useQuery({
+    queryKey: ['/api/events'],
+    refetchOnWindowFocus: true,
+  });
+
+  // Use fetched events or empty array if no data yet
+  const events: Event[] = Array.isArray(eventsData) ? eventsData : [];
+
+  // Filter events based on search and filters
+  const filteredEvents = events.filter((event: Event) => {
+    // Search filter
+    if (searchTerm && !event.title.toLowerCase().includes(searchTerm.toLowerCase())) {
+      return false;
+    }
+    
+    // Category filter
+    if (filters?.category?.length && !filters.category.includes(event.category)) {
+      return false;
+    }
+    
+    // Payment type filter
+    if (filters?.paymentType?.length && !filters.paymentType.includes(event.paymentType)) {
+      return false;
+    }
+    
+    // Date filter handling
+    if (filters?.date && filters.date !== 'all') {
+      const eventDate = new Date(event.date);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      
+      const nextWeekStart = new Date(today);
+      nextWeekStart.setDate(nextWeekStart.getDate() + 7);
+      
+      const nextWeekEnd = new Date(nextWeekStart);
+      nextWeekEnd.setDate(nextWeekEnd.getDate() + 7);
+      
+      // Get the current day of the week (0 = Sunday, 6 = Saturday)
+      const currentDay = today.getDay();
+      
+      // Calculate days until next weekend (Friday and Saturday)
+      const daysUntilFriday = (5 - currentDay + 7) % 7;
+      const daysUntilSunday = (7 - currentDay) % 7;
+      
+      // Calculate next weekend dates
+      const nextFriday = new Date(today);
+      nextFriday.setDate(today.getDate() + daysUntilFriday);
+      
+      const nextSunday = new Date(today);
+      nextSunday.setDate(today.getDate() + daysUntilSunday);
+      
+      switch (filters.date) {
+        case 'today':
+          // Event date must be today
+          return eventDate.toDateString() === today.toDateString();
+          
+        case 'tomorrow':
+          // Event date must be tomorrow
+          return eventDate.toDateString() === tomorrow.toDateString();
+          
+        case 'this_week':
+          // Event must be within the current week (next 7 days)
+          return eventDate >= today && eventDate < nextWeekStart;
+          
+        case 'next_week':
+          // Event must be within the next week (8-14 days from now)
+          return eventDate >= nextWeekStart && eventDate < nextWeekEnd;
+          
+        case 'weekend':
+          // Event must be on the upcoming weekend (Friday to Sunday)
+          return eventDate >= nextFriday && eventDate <= nextSunday;
+          
+        default:
+          return true;
+      }
+    }
+    
+    return true;
+  });
+
+  // Estado para controlar el menú contextual
+  const [contextMenu, setContextMenu] = useState<{
+    visible: boolean;
+    x: number;
+    y: number;
+    lngLat: mapboxgl.LngLat | null;
+  }>({
+    visible: false,
+    x: 0,
+    y: 0,
+    lngLat: null
+  });
+  
+  // Efecto principal para manejar los clics en el mapa (siempre activo)
+  useEffect(() => {
+    // Esta función se ejecutará cada vez que el usuario haga clic en el mapa
+    function handleMapClick(e: mapboxgl.MapMouseEvent) {
+      console.log("Clic en el mapa detectado", locationMode ? "en modo ubicación" : "en modo normal");
+      
+      // Detener la propagación para evitar que otros handlers cierren nuestro menú
+      e.originalEvent.stopPropagation();
+      
+      // Limpiar cualquier marcador temporal previo
+      if (tempLocationMarker) {
+        tempLocationMarker.remove();
+        setTempLocationMarker(null);
+      }
+      
+      // SIEMPRE mostrar el menú contextual sin importar el modo
+      console.log("Abriendo menú contextual en", e.lngLat);
+      
+      // IMPORTANTE: Activar el modo de ubicación al hacer clic en el mapa
+      // Esto permite que el menú contextual se muestre sin tener que hacer clic en "Crear un evento" primero
+      if (!locationMode) {
+        console.log("Activando modo de ubicación automáticamente");
+        setLocationMode(true);
+      }
+      
+      // Crear un nuevo marcador en la ubicación del clic
+      if (mapRef.current) {
+        // Crear el marcador
+        const marker = new mapboxgl.Marker({
+          color: '#f43f5e', // Color rosa/rojo
+          draggable: false
+        })
+          .setLngLat(e.lngLat)
+          .addTo(mapRef.current);
+          
+        // Guardar referencia del marcador
+        setTempLocationMarker(marker);
+        
+        // PASO CRUCIAL: Mostrar el menú contextual INMEDIATAMENTE
+        const point = mapRef.current.project(e.lngLat);
+        
+        // Actualizar en un solo paso para evitar renders parciales que causen problemas
+        setContextMenu({
+          visible: true,
+          x: point.x,
+          y: point.y - 20, // Posicionar por encima del marcador
+          lngLat: e.lngLat
+        });
+        
+        // También guardar los datos de ubicación temporales
+        setTempLocationData({
+          latitude: e.lngLat.lat,
+          longitude: e.lngLat.lng,
+          locationName: "Ubicación seleccionada", 
+          locationAddress: "Cargando dirección..."
+        });
+      }
+      
+      // Usar ambos servicios en paralelo para obtener resultados más completos
+      const mapboxPromise = reverseGeocode(e.lngLat.lng, e.lngLat.lat);
+      const googlePromise = googleReverseGeocode(e.lngLat.lng, e.lngLat.lat);
+      const nearbyPlacesPromise = findNearbyPlaces(e.lngLat.lat, e.lngLat.lng, 100);
+      
+      // Procesar todos los resultados
+      Promise.all([mapboxPromise, googlePromise, nearbyPlacesPromise])
+        .then(([mapboxAddress, googleAddress, nearbyPlaces]) => {
+          console.log("Geocode results:", { mapboxAddress, googleAddress });
+          console.log("Nearby places:", nearbyPlaces);
+          
+          // Extraer nombre del lugar - primero comprobar si hay establecimientos cercanos
+          let locationName;
+          let address;
+          
+          // Prioridad 1: Si encontramos lugares importantes (parques, plazas, etc.) usar esos nombres
+          // Identificar posibles lugares importantes (parques, puntos de interés, etc.)
+          const importantPlaces = Array.isArray(nearbyPlaces) 
+            ? nearbyPlaces.filter(place => 
+                // Buscar parques, puntos de interés, atracciones, locales marcados, etc.
+                ['park', 'point_of_interest', 'establishment', 'premise', 'neighborhood', 'natural_feature']
+                  .some(type => place.types && place.types.includes(type))
+              )
+            : [];
+          
+          if (importantPlaces.length > 0) {
+            const place = importantPlaces[0]; // Usar el lugar más relevante
+            locationName = place.name || "Lugar del evento";
+            
+            // Para la dirección completa, usar el resultado de geocodificación inversa
+            if (googleAddress && googleAddress !== "Dirección no encontrada" && googleAddress !== "Error al obtener dirección") {
+              address = googleAddress;
+            } else {
+              address = mapboxAddress;
+            }
+            
+            console.log("Usando nombre de lugar importante:", locationName);
+          } 
+          // Prioridad 2: Cualquier establecimiento cercano
+          else if (Array.isArray(nearbyPlaces) && nearbyPlaces.length > 0) {
+            const place = nearbyPlaces[0];
+            locationName = place.name || "Lugar del evento";
+            
+            // Para la dirección completa, usar el resultado de geocodificación inversa
+            if (googleAddress && googleAddress !== "Dirección no encontrada" && googleAddress !== "Error al obtener dirección") {
+              address = googleAddress;
+            } else {
+              address = mapboxAddress;
+            }
+            
+            console.log("Usando nombre de establecimiento cercano:", locationName);
+          } 
+          // Prioridad 3: Usar los resultados de geocodificación inversa de Google
+          else if (googleAddress && googleAddress !== "Dirección no encontrada" && googleAddress !== "Error al obtener dirección") {
+            // Buscar un nombre significativo que no sea solo una dirección
+            // Primero verificar si hay algo como "Parque X" o "Plaza Y" en la dirección
+            const specialPlaceMatch = googleAddress.match(/(Parque|Plaza|Museo|Estadio|Monumento|Jardín|Biblioteca|Universidad|Teatro|Centro)\s+([^,]+)/i);
+            
+            if (specialPlaceMatch) {
+              // Usamos el nombre del lugar especial si lo encontramos
+              locationName = specialPlaceMatch[0];
+            } else {
+              // Si no, usamos la primera parte de la dirección
+              const placeNameMatch = googleAddress.match(/^([^,]+)/);
+              locationName = placeNameMatch ? placeNameMatch[0] : "Lugar del evento";
+            }
+            
+            address = googleAddress;
+            console.log("Usando dirección de Google:", address);
+          } 
+          // Última opción: MapBox como fallback
+          else {
+            // Buscar un nombre significativo que no sea solo una dirección
+            const specialPlaceMatch = mapboxAddress.match(/(Parque|Plaza|Museo|Estadio|Monumento|Jardín|Biblioteca|Universidad|Teatro|Centro)\s+([^,]+)/i);
+            
+            if (specialPlaceMatch) {
+              // Usamos el nombre del lugar especial si lo encontramos
+              locationName = specialPlaceMatch[0];
+            } else {
+              // Si no, usamos la primera parte de la dirección
+              const placeNameMatch = mapboxAddress.match(/^([^,]+)/);
+              locationName = placeNameMatch ? placeNameMatch[0] : "Lugar del evento";
+            }
+            
+            address = mapboxAddress;
+            console.log("Usando dirección de MapBox (fallback):", address);
+          }
+          
+          // Store location data
+          const locationData = {
+            latitude: e.lngLat.lat,
+            longitude: e.lngLat.lng,
+            locationAddress: address,
+            locationName: locationName
+          };
+          
+          console.log("Guardando datos de ubicación:", locationData);
+          setTempLocationData(locationData);
+          
+          toast({
+            title: "Ubicación seleccionada",
+            description: `${locationName}`,
+          });
+        })
+        .catch(error => {
+          console.error("Error getting address or nearby places:", error);
+          toast({
+            title: "Error",
+            description: "No se pudo obtener la dirección. Por favor, intenta de nuevo.",
+            variant: "destructive",
+          });
+        });
+    }
+
+    if (mapRef.current) {
+      console.log("Configurando manejador de clics en el mapa");
+      
+      // Primero eliminar cualquier manejador existente para evitar duplicados
+      mapRef.current.off('click', handleMapClick);
+      
+      // Luego añadir el manejador de clics
+      mapRef.current.on('click', handleMapClick);
+      
+      // Return cleanup function
+      return () => {
+        if (mapRef.current) {
+          console.log("Eliminando manejador de clics del mapa");
+          mapRef.current.off('click', handleMapClick);
+        }
+      };
+    }
+  }, [toast, tempLocationMarker]); // Removed locationMode from dependencies to ensure the click handler stays consistent
+  
+  // Initialize map on component mount and center on user's location
+  useEffect(() => {
+    if (!mapContainerRef.current || mapRef.current) return;
+
+    console.log("Inicializando mapa y configurando eventos globales");
+
+    // Initialize the map with default config
+    mapRef.current = initializeMap(mapContainerRef.current);
+    
+    // Add controls
+    mapRef.current.addControl(new mapboxgl.NavigationControl(), 'top-right');
+
+    // Try to center on user's location automatically
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const { longitude, latitude } = position.coords;
+        
+        if (mapRef.current) {
+          mapRef.current.setCenter([longitude, latitude]);
+          mapRef.current.setZoom(13);
+          
+          // Add a marker for the user's current position
+          new mapboxgl.Marker({ color: '#1DA1F2' })
+            .setLngLat([longitude, latitude])
+            .addTo(mapRef.current);
+            
+          // Try to get the city name for a better user experience
+          reverseGeocode(longitude, latitude)
+            .then(address => {
+              toast({
+                title: "Ubicación detectada",
+                description: `Te mostramos eventos cercanos a tu ubicación`,
+              });
+            })
+            .catch(err => console.error("Error getting address:", err));
+        }
+      },
+      (error) => {
+        console.warn("Error getting location:", error);
+        // Fallback to default location (centered on a major city)
+        if (mapRef.current) {
+          // Center on Buenos Aires by default (more relevant for Spanish-speaking users)
+          mapRef.current.setCenter([-58.3816, -34.6037]);
+          mapRef.current.setZoom(12);
+        }
+      },
+      { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+    );
+
+    return () => {
+      console.log("Limpiando el mapa al desmontar componente");
+      
+      // Clean up on unmount
+      if (mapRef.current) {
+        try {
+          // Limpiar los marcadores y popups primero
+          markersRef.current.forEach(marker => marker.remove());
+          popupsRef.current.forEach(popup => popup.remove());
+          markersRef.current = [];
+          popupsRef.current = [];
+          
+          // Eliminar cualquier marcador temporal
+          if (tempLocationMarker) {
+            tempLocationMarker.remove();
+            setTempLocationMarker(null);
+          }
+          
+          // Eliminar el mapa
+          mapRef.current.remove();
+          mapRef.current = null;
+        } catch (error) {
+          console.error("Error limpiando recursos del mapa:", error);
+        }
+      }
+    };
+  }, []);
+
+  // Efecto para cerrar el menú contextual y limpiar marcadores temporales al hacer clic en cualquier parte de la aplicación 
+  // que no sea el mapa o los botones de acción
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      const target = e.target as Element;
+      
+      // Comprobar si es un clic dentro del mapa
+      const isMapClick = target.closest('.mapboxgl-canvas-container');
+      
+      // Comprobar si es un clic en los botones de acción
+      const isActionButton = target.closest('button') && (
+        target.textContent?.includes('Buscar eventos aquí') || 
+        target.textContent?.includes('Crear un evento aquí') ||
+        target.textContent?.includes('Ver eventos cercanos') ||
+        target.textContent?.includes('Crear evento aquí')
+      );
+      
+      // Comprobar si es un clic en el menú contextual
+      const isContextMenuClick = target.closest('.context-menu');
+      
+      // IMPORTANTE: Evitamos cerrar el menú contextual con clicks outside
+      // Solo cerramos en casos muy específicos, por ejemplo si se hace clic en otra parte 
+      // de la aplicación que no sea el mapa, el menú o los botones de acción
+      // Agregamos un log para depuración
+      if (contextMenu.visible) {
+        console.log("Click outside detectado - contextMenu visible, analizando objetivo:", {
+          isMapClick,
+          isContextMenuClick,
+          isActionButton
+        });
+        
+        // Solo cerramos si no es ninguno de los elementos permitidos
+        if (!isMapClick && !isContextMenuClick && !isActionButton) {
+          console.log("Cerrando menú contextual por clic fuera de elementos permitidos");
+          closeContextMenu();
+        } else {
+          console.log("Manteniendo menú contextual visible");
+        }
+      }
+      
+      // Limpiar el marcador temporal y ocultar botones de acción si el clic no fue en:
+      // - El mapa
+      // - Los botones de acción específicos
+      // - La barra de búsqueda
+      // - Controles del mapa
+      if (showActionsForLocation && 
+          !isMapClick && 
+          !isActionButton && 
+          !target.closest('.google-places-search') && 
+          !target.closest('.mapboxgl-ctrl')) {
+        
+        console.log("Clic fuera de la ubicación seleccionada, ocultando botones de acción");
+        
+        // Ocultar botones de acciones específicas
+        setShowActionsForLocation(false);
+        
+        // Limpiar el marcador temporal si existe
+        if (tempLocationMarker) {
+          tempLocationMarker.remove();
+          setTempLocationMarker(null);
+        }
+      }
+    }
+    
+    document.addEventListener('click', handleClickOutside);
+    
+    return () => {
+      document.removeEventListener('click', handleClickOutside);
+    };
+  }, [contextMenu.visible, showActionsForLocation, tempLocationMarker]);
+  
+  // Efecto para detectar cuando se cierra el formulario de creación de evento
+  useEffect(() => {
+    if (resetLocationOnFormClose) {
+      console.log("Detectada señal de cierre de formulario, limpiando marcadores temporales");
+      cleanupTempMarkers();
+    }
+  }, [resetLocationOnFormClose]);
+
+  // Add event markers when events or filters change
+  useEffect(() => {
+    if (!mapRef.current) return;
+    
+    // Clear existing markers and popups
+    markersRef.current.forEach(marker => marker.remove());
+    popupsRef.current.forEach(popup => popup.remove());
+    markersRef.current = [];
+    popupsRef.current = [];
+    
+    // Add markers for filtered events
+    filteredEvents.forEach((event: Event) => {
+      if (!mapRef.current) return;
+      
+      // Create custom React element for the marker
+      const el = document.createElement('div');
+      el.className = "custom-marker-container";
+
+      // Render React component to the element
+      const root = createRoot(el);
+      root.render(<EventPin category={event.category} />);
+      
+      // Create popup
+      const popup = new mapboxgl.Popup({ offset: 25 })
+        .setHTML(`
+          <div class="popup-content">
+            <h3 class="font-bold">${event.title}</h3>
+            <p class="text-sm">${event.locationName}</p>
+            <p class="text-xs text-gray-500">
+              ${new Date(event.date).toLocaleDateString('es-ES', { 
+                month: 'short', 
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+              })}
+            </p>
+          </div>
+        `);
+      
+      // Validar y convertir coordenadas
+      const lng = typeof event.longitude === 'string' ? parseFloat(event.longitude) : event.longitude;
+      const lat = typeof event.latitude === 'string' ? parseFloat(event.latitude) : event.latitude;
+      
+      // Verificar que las coordenadas sean números válidos
+      if (isNaN(lng) || isNaN(lat)) {
+        console.error('Coordenadas inválidas para el evento:', event.id, event.title, {
+          longitude: event.longitude,
+          latitude: event.latitude
+        });
+        return; // Saltar este evento si las coordenadas no son válidas
+      }
+      
+      // Crear marcador solo si las coordenadas son válidas
+      const marker = new mapboxgl.Marker(el)
+        .setLngLat([lng, lat])
+        .setPopup(popup)
+        .addTo(mapRef.current);
+      
+      // Add event listener to marker
+      el.addEventListener('click', () => {
+        onEventSelect(event);
+      });
+      
+      // Track markers and popups for cleanup
+      markersRef.current.push(marker);
+      popupsRef.current.push(popup);
+    });
+  }, [filteredEvents, onEventSelect]);
+
+  // Handle search functionality
+  const handleSearch = (term: string) => {
+    setSearchTerm(term);
+  };
+  
+  // Función para limpiar los marcadores temporales y resetear el estado relacionado
+  const cleanupTempMarkers = () => {
+    console.log("Ejecutando limpieza forzada de marcadores temporales");
+    
+    // Limpiar el marcador temporal si existe
+    if (tempLocationMarker) {
+      console.log("Eliminando marcador temporal existente");
+      tempLocationMarker.remove();
+      setTempLocationMarker(null);
+    }
+    
+    // También limpiar los datos de ubicación temporal
+    setTempLocationData(null);
+    
+    // Resetear el modo de ubicación si está activo
+    if (locationMode) {
+      console.log("Desactivando modo de ubicación");
+      setLocationMode(false);
+    }
+    
+    // Ocultar los botones de acción
+    setShowActionsForLocation(false);
+    
+    // Cerrar cualquier menú contextual abierto
+    setContextMenu({
+      visible: false,
+      x: 0,
+      y: 0,
+      lngLat: null
+    });
+    
+    // Forzar limpieza de cualquier otro marcador que podría haberse quedado
+    // Este enfoque es más agresivo pero asegura que no queden marcadores huérfanos
+    if (mapRef.current) {
+      // Obtener todos los marcadores del mapa
+      const markers = Array.from(document.querySelectorAll('.mapboxgl-marker'));
+      if (markers.length > 0) {
+        console.log(`Limpiando ${markers.length} marcadores encontrados en el DOM`);
+        
+        // Eliminar solo los marcadores temporales (para evitar eliminar los de eventos)
+        markers.forEach(markerElement => {
+          // Los marcadores de eventos tienen la clase custom-marker-container como hijo
+          const isEventMarker = markerElement.querySelector('.custom-marker-container');
+          if (!isEventMarker) {
+            console.log("Eliminando marcador huérfano");
+            markerElement.remove();
+          }
+        });
+      }
+    }
+  };
+  
+  // Función para cerrar el menú contextual 
+  const closeContextMenu = () => {
+    // Asegurarse de que el menú contextual se cierre correctamente
+    setContextMenu({
+      visible: false,
+      x: 0,
+      y: 0,
+      lngLat: null
+    });
+    
+    // También ocultar los botones de acción que podrían estar visibles
+    setShowActionsForLocation(false);
+    
+    // Siempre limpiar el marcador temporal para que no quede visible en el mapa
+    // Esto asegura que al hacer clic en Cancelar, siempre se elimine el marcador
+    if (tempLocationMarker) {
+      console.log("Eliminando marcador temporal al cerrar/cancelar acción");
+      tempLocationMarker.remove();
+      setTempLocationMarker(null);
+      setTempLocationData(null);
+    }
+    
+    // Al cerrar el menú contextual con Cancelar, además de eliminar el marcador,
+    // también salimos del modo de ubicación si estamos en él 
+    // y regresamos al estado normal con los botones principales
+    if (locationMode) {
+      console.log("Saliendo del modo de ubicación al cancelar");
+      setLocationMode(false);
+    }
+  };
+  
+  // Función para crear un evento en la ubicación del menú contextual
+  const handleCreateEventAtLocation = async () => {
+    if (contextMenu.lngLat) {
+      const { lng, lat } = contextMenu.lngLat;
+      
+      try {
+        // Obtener información sobre la ubicación seleccionada
+        const mapboxPromise = reverseGeocode(lng, lat);
+        const googlePromise = googleReverseGeocode(lng, lat);
+        const nearbyPlacesPromise = findNearbyPlaces(lat, lng, 100);
+        
+        // Procesar resultados
+        const [mapboxAddress, googleAddress, nearbyPlaces] = await Promise.all([
+          mapboxPromise, googlePromise, nearbyPlacesPromise
+        ]);
+        
+        // Determinar el nombre y dirección del lugar
+        let locationName;
+        let address;
+        
+        // Prioridad 1: Si encontramos lugares importantes (parques, plazas, etc.) usar esos nombres
+        // Identificar posibles lugares importantes (parques, puntos de interés, etc.)
+        const importantPlaces = Array.isArray(nearbyPlaces) 
+          ? nearbyPlaces.filter(place => 
+              // Buscar parques, puntos de interés, atracciones, locales marcados, etc.
+              ['park', 'point_of_interest', 'establishment', 'premise', 'neighborhood', 'natural_feature']
+                .some(type => place.types && place.types.includes(type))
+            )
+          : [];
+        
+        if (importantPlaces.length > 0) {
+          const place = importantPlaces[0]; // Usar el lugar más relevante
+          locationName = place.name || "Lugar del evento";
+          
+          // Para la dirección completa, usar el resultado de geocodificación inversa
+          address = googleAddress || mapboxAddress;
+          
+          console.log("Usando nombre de lugar importante (menú contextual):", locationName);
+        } 
+        // Prioridad 2: Cualquier establecimiento cercano
+        else if (Array.isArray(nearbyPlaces) && nearbyPlaces.length > 0) {
+          locationName = nearbyPlaces[0].name || "Lugar del evento";
+          
+          // Para la dirección completa usamos geocodificación inversa
+          address = googleAddress || mapboxAddress;
+          
+          console.log("Usando nombre de establecimiento cercano (menú contextual):", locationName);
+        } 
+        // Prioridad 3: Buscar nombres significativos en los resultados de geocodificación
+        else if (googleAddress && googleAddress !== "Dirección no encontrada") {
+          address = googleAddress;
+          
+          // Buscar si hay algo como "Parque X" o "Plaza Y" en la dirección
+          const specialPlaceMatch = address.match(/(Parque|Plaza|Museo|Estadio|Monumento|Jardín|Biblioteca|Universidad|Teatro|Centro)\s+([^,]+)/i);
+          
+          if (specialPlaceMatch) {
+            // Usamos el nombre del lugar especial si lo encontramos
+            locationName = specialPlaceMatch[0];
+            console.log("Encontrado nombre de lugar en dirección Google:", locationName);
+          } else {
+            // Si no, usamos la primera parte de la dirección
+            const namePart = googleAddress.split(',')[0];
+            locationName = namePart || "Lugar del evento";
+          }
+        }
+        // Última opción: MapBox como fallback
+        else {
+          address = mapboxAddress;
+          
+          // Buscar si hay algo como "Parque X" o "Plaza Y" en la dirección
+          const specialPlaceMatch = address.match(/(Parque|Plaza|Museo|Estadio|Monumento|Jardín|Biblioteca|Universidad|Teatro|Centro)\s+([^,]+)/i);
+          
+          if (specialPlaceMatch) {
+            // Usamos el nombre del lugar especial si lo encontramos
+            locationName = specialPlaceMatch[0];
+            console.log("Encontrado nombre de lugar en dirección MapBox:", locationName);
+          } else {
+            // Si no, usamos la primera parte de la dirección
+            const namePart = mapboxAddress.split(',')[0];
+            locationName = namePart || "Lugar del evento";
+          }
+        }
+        
+        // Crear objeto de ubicación
+        const locationData = {
+          latitude: lat,
+          longitude: lng,
+          locationAddress: address,
+          locationName: locationName
+        };
+        
+        // Cerrar menú contextual
+        closeContextMenu();
+        
+        // Iniciar creación de evento con esta ubicación
+        onCreateEventClick(locationData);
+      }
+      catch (error) {
+        console.error("Error al obtener información de la ubicación:", error);
+        toast({
+          title: "Error",
+          description: "No se pudo obtener información sobre esta ubicación. Inténtalo de nuevo.",
+          variant: "destructive"
+        });
+      }
+    }
+  };
+  
+  // Función para buscar eventos cercanos desde una ubicación específica
+  const handleSearchNearbyEvents = (lngLat: mapboxgl.LngLat) => {
+    if (mapRef.current) {
+      // Obtener las coordenadas
+      const lng = lngLat.lng;
+      const lat = lngLat.lat;
+      
+      console.log("Buscando eventos cerca de:", { lng, lat });
+      
+      // Centrar el mapa en la ubicación seleccionada
+      mapRef.current.flyTo({
+        center: [lng, lat],
+        zoom: 15,
+        essential: true,
+        duration: 1000
+      });
+      
+      // Mostrar un toast para indicar que se están buscando eventos
+      toast({
+        title: "Buscando eventos",
+        description: "Buscando eventos cercanos a esta ubicación...",
+      });
+      
+      // Actualizar el estado con la ubicación actual y mostrar panel de filtros
+      setCurrentLocation({
+        lng: lng,
+        lat: lat,
+        locationName: "Ubicación seleccionada",
+        locationAddress: ""
+      });
+      
+      // Mostrar panel de eventos
+      setEventsPanelVisible(true);
+      
+      // Aquí se podrían hacer otras acciones como cargar eventos desde la API
+    }
+  };
+  
+  // Función para buscar eventos cercanos a la ubicación del menú contextual
+  const handleFindNearbyEvents = () => {
+    if (contextMenu.lngLat && mapRef.current) {
+      // Guardar las coordenadas antes de cerrar el menú contextual
+      const lng = contextMenu.lngLat.lng;
+      const lat = contextMenu.lngLat.lat;
+      
+      // Cerrar menú contextual primero
+      closeContextMenu();
+      
+      // Centrar el mapa en la ubicación seleccionada
+      mapRef.current.flyTo({
+        center: [lng, lat],
+        zoom: 15,
+        essential: true,
+        duration: 1000
+      });
+      
+      // FILTROS ACTIVADOS: cargar eventos cercanos a las coordenadas seleccionadas
+      
+      // Actualizar el estado con la ubicación actual
+      setCurrentLocation({
+        lng: lng,
+        lat: lat,
+        locationName: "Ubicación seleccionada",
+        locationAddress: ""
+      });
+      
+      // Filtrar eventos por cercanía a estas coordenadas
+      const nearbyEvents = events.filter((event: Event) => {
+        // Verificar distancia (si hay coordenadas válidas)
+        let distanceMatch = false;
+        const eventLat = typeof event.latitude === 'string' ? parseFloat(event.latitude) : event.latitude;
+        const eventLng = typeof event.longitude === 'string' ? parseFloat(event.longitude) : event.longitude;
+        
+        if (!isNaN(eventLat) && !isNaN(eventLng)) {
+          const distance = calculateDistance(
+            lat, 
+            lng, 
+            eventLat, 
+            eventLng
+          );
+          distanceMatch = distance <= 2; // Radio de 2 km
+        }
+        
+        return distanceMatch;
+      });
+      
+      // Actualizar el estado con los eventos filtrados
+      setLocationFilteredEvents(nearbyEvents);
+      
+      // Mostrar panel de eventos
+      setEventsPanelVisible(true);
+      
+      // Eliminar cualquier marcador temporal previo
+      cleanupTempMarkers();
+      
+      // Crear un nuevo marcador en la ubicación seleccionada
+      if (mapRef.current) {
+        const marker = new mapboxgl.Marker({
+          color: '#1DA1F2'
+        })
+          .setLngLat([lng, lat])
+          .addTo(mapRef.current);
+          
+        // Guardar la referencia del marcador para poder eliminarlo después
+        setTempLocationMarker(marker);
+        
+        // Programar la eliminación automática del marcador después de 5 segundos
+        setTimeout(() => {
+          if (marker) {
+            marker.remove();
+            setTempLocationMarker(null);
+          }
+        }, 5000);
+      }
+      
+      // Mostrar notificación según el número de eventos encontrados
+      if (nearbyEvents.length > 0) {
+        toast({
+          title: `${nearbyEvents.length} eventos encontrados`,
+          description: "Mostrando eventos cercanos a este lugar",
+        });
+      } else {
+        toast({
+          title: "No se encontraron eventos",
+          description: "No hay eventos cerca de esta ubicación",
+          variant: "destructive"
+        });
+      }
+    }
+  };
+
+  // Function to toggle location selection mode
+  const toggleLocationMode = () => {
+    // If we're exiting location mode, clean up
+    if (locationMode) {
+      resetLocationSelection();
+    } else {
+      // Enter location selection mode
+      toast({
+        title: "Modo de selección activado",
+        description: "Haz clic en el mapa o busca un lugar para seleccionar la ubicación del evento",
+      });
+      
+      // Asegurarnos de que se limpie cualquier menú contextual abierto
+      setContextMenu({
+        visible: false,
+        x: 0,
+        y: 0,
+        lngLat: null
+      });
+      
+      // Limpiar cualquier marcador temporal que pueda existir
+      if (tempLocationMarker) {
+        tempLocationMarker.remove();
+        setTempLocationMarker(null);
+      }
+    }
+    
+    // Toggle mode - esta variable controla si estamos en modo de crear evento específicamente
+    setLocationMode(!locationMode);
+  };
+  
+  // Function to handle place selection from the search bar
+  const handlePlaceSelect = async (place: {
+    latitude: number;
+    longitude: number;
+    locationName: string;
+    locationAddress: string;
+  }) => {
+    console.log("Lugar seleccionado en la búsqueda:", place);
+    
+    // Si no estamos en modo de selección de ubicación, simplemente centrar el mapa
+    if (!locationMode && mapRef.current) {
+      const longitude = typeof place.longitude === 'string' ? parseFloat(place.longitude) : place.longitude;
+      const latitude = typeof place.latitude === 'string' ? parseFloat(place.latitude) : place.latitude;
+      
+      // Centrar el mapa en la ubicación seleccionada
+      mapRef.current.flyTo({
+        center: [longitude, latitude],
+        zoom: 15,
+        essential: true,
+        duration: 1000
+      });
+      
+      // Opcional: Añadir un marcador temporal
+      if (tempLocationMarker) {
+        tempLocationMarker.remove();
+      }
+      
+      const marker = new mapboxgl.Marker({
+        color: '#1DA1F2'
+      })
+        .setLngLat([longitude, latitude])
+        .addTo(mapRef.current);
+      
+      // Guardamos la referencia del marcador temporal
+      setTempLocationMarker(marker);
+      
+      // Guardar la ubicación actual para los botones de acción
+      setCurrentLocation({
+        lng: longitude,
+        lat: latitude,
+        locationName: place.locationName,
+        locationAddress: place.locationAddress
+      });
+      
+      // Mostrar los botones de acción para esta ubicación
+      setShowActionsForLocation(true);
+      
+      // Mostrar toast con información
+      toast({
+        title: place.locationName,
+        description: place.locationAddress,
+      });
+      
+      return;
+    }
+    
+    // Si estamos en modo de selección de ubicación, procesar normalmente
+    if (locationMode && mapRef.current) {
+      // Remove previous marker if exists
+      if (tempLocationMarker) {
+        tempLocationMarker.remove();
+      }
+      
+      // Asegurar que las coordenadas sean números
+      const latitude = typeof place.latitude === 'string' ? parseFloat(place.latitude) : place.latitude;
+      const longitude = typeof place.longitude === 'string' ? parseFloat(place.longitude) : place.longitude;
+      
+      console.log("Coordenadas recibidas:", {
+        latitude,
+        longitude,
+        tipo_lat: typeof latitude,
+        tipo_lng: typeof longitude
+      });
+      
+      const coordinates: [number, number] = [longitude, latitude];
+      
+      // Create a new marker
+      const marker = new mapboxgl.Marker({
+        color: '#FF385C',
+        draggable: true
+      })
+        .setLngLat(coordinates)
+        .addTo(mapRef.current);
+      
+      // Fly to the location
+      mapRef.current.flyTo({
+        center: coordinates,
+        zoom: 15,
+        essential: true,
+        duration: 1000
+      });
+      
+      // Store the marker reference
+      setTempLocationMarker(marker);
+      
+      // Intentar utilizar geocodificación inversa de Google Maps para mejor consistencia
+      try {
+        console.log("Solicitando geocodificación inversa de Google para:", longitude, latitude);
+        const googleAddress = await googleReverseGeocode(longitude, latitude);
+        console.log("Google devolvió la dirección:", googleAddress);
+        
+        const locationData = {
+          latitude: parseFloat(String(latitude)),
+          longitude: parseFloat(String(longitude)),
+          // Usar la dirección completa de Google para la dirección
+          locationAddress: googleAddress || place.locationAddress,
+          // IMPORTANTE: Mantener el nombre original del lugar que el usuario seleccionó
+          locationName: place.locationName
+        };
+        
+        console.log("Guardando datos de ubicación (Google):", locationData);
+        setTempLocationData(locationData);
+        
+        toast({
+          title: "Ubicación seleccionada",
+          description: googleAddress || place.locationAddress,
+        });
+      } catch (error) {
+        console.error("Error obteniendo dirección de Google:", error);
+        
+        // Fallback a la dirección original
+        const fallbackData = {
+          latitude: parseFloat(String(latitude)),
+          longitude: parseFloat(String(longitude)),
+          locationAddress: place.locationAddress,
+          locationName: place.locationName
+        };
+        
+        console.log("Guardando datos de ubicación (fallback):", fallbackData);
+        setTempLocationData(fallbackData);
+        
+        toast({
+          title: "Ubicación seleccionada",
+          description: place.locationAddress,
+        });
+      }
+      
+      // Add dragend event to update data when marker is dragged
+      marker.on('dragend', async () => {
+        const lngLat = marker.getLngLat();
+        
+        // Intentar obtener dirección usando Google primero para mantener consistencia
+        try {
+          const googleAddress = await googleReverseGeocode(lngLat.lng, lngLat.lat);
+          
+          const updatedData = {
+            latitude: parseFloat(String(lngLat.lat)),
+            longitude: parseFloat(String(lngLat.lng)),
+            locationAddress: googleAddress,
+            locationName: googleAddress.split(',')[0] || "Ubicación seleccionada"
+          };
+          
+          console.log("Actualizando ubicación tras arrastrar (Google):", updatedData);
+          setTempLocationData(updatedData);
+          
+          toast({
+            title: "Ubicación actualizada",
+            description: googleAddress,
+          });
+        } catch (error) {
+          console.error("Error obteniendo dirección de Google al arrastrar:", error);
+          
+          // Fallback a MapBox si Google falla
+          try {
+            const mapboxAddress = await reverseGeocode(lngLat.lng, lngLat.lat);
+            
+            const fallbackData = {
+              latitude: parseFloat(String(lngLat.lat)),
+              longitude: parseFloat(String(lngLat.lng)),
+              locationAddress: mapboxAddress,
+              locationName: mapboxAddress.split(',')[0] || "Ubicación seleccionada"
+            };
+            
+            console.log("Actualizando ubicación tras arrastrar (Mapbox):", fallbackData);
+            setTempLocationData(fallbackData);
+            
+            toast({
+              title: "Ubicación actualizada",
+              description: mapboxAddress,
+            });
+          } catch (mapboxError) {
+            console.error("Error también con Mapbox:", mapboxError);
+            
+            // Último recurso si ambos fallan
+            const basicData = {
+              latitude: parseFloat(String(lngLat.lat)),
+              longitude: parseFloat(String(lngLat.lng)),
+              locationAddress: "Dirección desconocida",
+              locationName: "Lugar del evento"
+            };
+            
+            console.log("Actualizando ubicación con datos básicos:", basicData);
+            setTempLocationData(basicData);
+            
+            toast({
+              title: "Ubicación actualizada",
+              description: "No se pudo obtener la dirección exacta",
+              variant: "destructive"
+            });
+          }
+        }
+      });
+    }
+  };
+  
+  // Function to reset location selection - Simplified and improved version
+  const resetLocationSelection = () => {
+    console.log("Reseteando selección de ubicación");
+    
+    // Limpiar el marcador temporal si existe
+    if (tempLocationMarker) {
+      tempLocationMarker.remove();
+      setTempLocationMarker(null);
+    }
+    
+    // Limpiar datos de ubicación temporal
+    setTempLocationData(null);
+    
+    // Asegurarse de que el menú contextual esté cerrado
+    setContextMenu({
+      visible: false,
+      x: 0,
+      y: 0,
+      lngLat: null
+    });
+    
+    // Resetear el modo de ubicación (si está activo)
+    if (locationMode) {
+      console.log("Limpiando modo de ubicación");
+      setLocationMode(false);
+    }
+    
+    // Resetear cualquier otro estado relacionado con la selección de ubicación
+    setShowActionsForLocation(false);
+    
+    // Limpiar cualquier marcador huérfano que pueda haber quedado
+    console.log("Limpiando marcadores huérfanos del DOM");
+    document.querySelectorAll('.mapboxgl-marker').forEach(element => {
+      element.remove();
+    });
+  };
+  
+  // Function to confirm location selection
+  const confirmLocationSelection = async () => {
+    if (tempLocationData) {
+      console.log("Confirmando ubicación original (Mapbox):", tempLocationData);
+      
+      try {
+        // Intentar obtener la dirección usando Google Maps para consistencia
+        const googleAddress = await googleReverseGeocode(
+          tempLocationData.longitude, 
+          tempLocationData.latitude
+        );
+        
+        // Crear objeto de ubicación con formato correcto para Google Maps
+        // Garantizamos explícitamente que las coordenadas son números
+        const locationData = {
+          latitude: Number(tempLocationData.latitude),
+          longitude: Number(tempLocationData.longitude),
+          // Usar la dirección de Google para la dirección completa pero mantener el nombre original
+          locationAddress: googleAddress || tempLocationData.locationAddress,
+          // Mantener el nombre original del lugar en vez de usar la primera parte de la dirección
+          locationName: tempLocationData.locationName
+        };
+        
+        console.log('COORDENADAS CONFIRMADAS:', {
+          latitude: locationData.latitude,
+          longitude: locationData.longitude,
+          tipoLat: typeof locationData.latitude,
+          tipoLon: typeof locationData.longitude
+        });
+        
+        console.log("Ubicación reformateada para Google Maps:", locationData);
+        
+        // Call the function provided by parent to create event with the selected location
+        onCreateEventClick(locationData);
+        
+        // Clean up
+        resetLocationSelection();
+        setLocationMode(false);
+        
+        toast({
+          title: "Ubicación confirmada",
+          description: "Ahora puedes completar los detalles del evento",
+        });
+      } catch (error) {
+        console.error("Error al convertir coordenadas para Google Maps:", error);
+        
+        // Usar datos originales de Mapbox como fallback
+        const fallbackLocationData = {
+          latitude: Number(tempLocationData.latitude),
+          longitude: Number(tempLocationData.longitude),
+          locationAddress: tempLocationData.locationAddress,
+          locationName: tempLocationData.locationName
+        };
+        
+        console.log('COORDENADAS FALLBACK:', {
+          latitude: fallbackLocationData.latitude,
+          longitude: fallbackLocationData.longitude,
+          tipoLat: typeof fallbackLocationData.latitude,
+          tipoLon: typeof fallbackLocationData.longitude
+        });
+        
+        console.log("Usando ubicación de fallback:", fallbackLocationData);
+        onCreateEventClick(fallbackLocationData);
+        
+        resetLocationSelection();
+        setLocationMode(false);
+        
+        toast({
+          title: "Ubicación confirmada",
+          description: "Ahora puedes completar los detalles del evento",
+        });
+      }
+    } else {
+      toast({
+        title: "No hay ubicación seleccionada",
+        description: "Haz clic en el mapa para seleccionar la ubicación del evento",
+        variant: "destructive",
+      });
+    }
+  };
+  
+  // Función para calcular la distancia entre dos puntos de coordenadas en km (fórmula de Haversine)
+  const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
+    const R = 6371; // Radio de la Tierra en km
+    const dLat = (lat2 - lat1) * (Math.PI / 180);
+    const dLon = (lon2 - lon1) * (Math.PI / 180);
+    const a = 
+      Math.sin(dLat/2) * Math.sin(dLat/2) +
+      Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) * 
+      Math.sin(dLon/2) * Math.sin(dLon/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    const distance = R * c; // Distancia en km
+    return distance;
+  };
+  
+  // Función para buscar eventos cercanos a la ubicación actual
+  const handleSearchEventsAtLocation = () => {
+    if (currentLocation && mapRef.current) {
+      // Centrar el mapa en la ubicación seleccionada
+      mapRef.current.flyTo({
+        center: [currentLocation.lng, currentLocation.lat],
+        zoom: 15,
+        essential: true,
+        duration: 1000
+      });
+      
+      // Filtrar eventos por cercanía y por nombre
+      if (currentLocation.locationName) {
+        // Convertir a minúsculas para comparar
+        const placeName = currentLocation.locationName.toLowerCase();
+        
+        console.log("Buscando eventos relacionados con:", placeName);
+        
+        // Filtrar eventos cercanos (radio de 2 km) o que contengan el nombre del lugar
+        const nearbyEvents = events.filter((event: Event) => {
+          // Verificar si la ubicación está en el nombre o descripción del evento
+          const nameMatch = event.title.toLowerCase().includes(placeName) || 
+                          (event.description && event.description.toLowerCase().includes(placeName)) ||
+                          (event.locationName && event.locationName.toLowerCase().includes(placeName));
+          
+          // Verificar distancia (si hay coordenadas válidas)
+          let distanceMatch = false;
+          const eventLat = typeof event.latitude === 'string' ? parseFloat(event.latitude) : event.latitude;
+          const eventLng = typeof event.longitude === 'string' ? parseFloat(event.longitude) : event.longitude;
+          
+          if (!isNaN(eventLat) && !isNaN(eventLng)) {
+            const distance = calculateDistance(
+              currentLocation.lat, 
+              currentLocation.lng, 
+              eventLat, 
+              eventLng
+            );
+            distanceMatch = distance <= 2; // Radio de 2 km
+            
+            if (distanceMatch) {
+              console.log(`Evento "${event.title}" está a ${distance.toFixed(2)} km`);
+            }
+          }
+          
+          // El evento coincide si está cerca o si contiene el nombre del lugar
+          return nameMatch || distanceMatch;
+        });
+        
+        console.log("Eventos cercanos o relacionados con", currentLocation.locationName, ":", nearbyEvents.length);
+        
+        // Actualizar el estado con los eventos filtrados
+        setLocationFilteredEvents(nearbyEvents);
+        
+        // Si hay eventos, mostrar notificación con el número
+        if (nearbyEvents.length > 0) {
+          toast({
+            title: `${nearbyEvents.length} eventos encontrados`,
+            description: `Eventos cerca de ${currentLocation.locationName}`,
+          });
+        } else {
+          toast({
+            title: "No se encontraron eventos",
+            description: `No hay eventos cerca de ${currentLocation.locationName}`,
+            variant: "destructive"
+          });
+        }
+      } else {
+        // Si no hay nombre de ubicación, usar todos los eventos
+        setLocationFilteredEvents(events);
+      }
+      
+      // Mostrar panel de eventos
+      setEventsPanelVisible(true);
+      
+      // Ocultar botones de acción
+      setShowActionsForLocation(false);
+      
+      // Limpiar marcadores
+      cleanupTempMarkers();
+      
+      // Importante: añadir un pequeño retraso para asegurar que no se quede el marcador
+      // Este enfoque asegura que cualquier otro marcador que pudiera ser generado
+      // por otras funciones también se elimine.
+      setTimeout(() => {
+        cleanupTempMarkers();
+      }, 100);
+    }
+  };
+  
+  // Función para crear un evento en la ubicación actual
+  const handleCreateEventAtCurrentLocation = async () => {
+    if (currentLocation) {
+      try {
+        // Intentar obtener más información sobre la ubicación
+        const googleAddress = await googleReverseGeocode(
+          currentLocation.lng, 
+          currentLocation.lat
+        );
+        
+        // Crear objeto de ubicación con el formato esperado
+        const locationData = {
+          latitude: currentLocation.lat,
+          longitude: currentLocation.lng,
+          locationAddress: currentLocation.locationAddress || googleAddress || "Dirección desconocida",
+          locationName: currentLocation.locationName || googleAddress?.split(',')[0] || "Lugar del evento"
+        };
+        
+        // Iniciar creación de evento
+        onCreateEventClick(locationData);
+        
+        // Resetear estados
+        resetLocationSelection();
+        setShowActionsForLocation(false);
+      }
+      catch (error) {
+        console.error("Error al preparar la ubicación para el evento:", error);
+        
+        // Usar los datos disponibles como fallback
+        const fallbackData = {
+          latitude: currentLocation.lat,
+          longitude: currentLocation.lng,
+          locationAddress: currentLocation.locationAddress || "Dirección desconocida",
+          locationName: currentLocation.locationName || "Lugar del evento"
+        };
+        
+        onCreateEventClick(fallbackData);
+        
+        // Resetear estados
+        resetLocationSelection();
+        setShowActionsForLocation(false);
+      }
+    }
+  };
+  
+  // Handle going to user's current location
+  const handleGoToCurrentLocation = async () => {
+    if (!mapRef.current) return;
+    
+    try {
+      const position = await getUserLocation(mapRef.current);
+      const { longitude, latitude } = position.coords;
+      
+      console.log("Obtenida ubicación actual:", {
+        latitude,
+        longitude,
+        tipo_lat: typeof latitude,
+        tipo_lng: typeof longitude
+      });
+      
+      mapRef.current.flyTo({
+        center: [longitude, latitude],
+        zoom: 15,
+        essential: true
+      });
+      
+      // If in location selection mode, set this as the location
+      if (locationMode) {
+        // Remove existing marker if any
+        if (tempLocationMarker) {
+          tempLocationMarker.remove();
+        }
+        
+        // Create marker at current location
+        const marker = new mapboxgl.Marker({ 
+          color: '#FF5A5F',
+          draggable: true 
+        })
+          .setLngLat([longitude, latitude])
+          .addTo(mapRef.current);
+        
+        setTempLocationMarker(marker);
+        
+        // Intentar obtener la dirección usando Google Maps para mejor consistencia
+        try {
+          console.log("Solicitando dirección de Google para ubicación actual");
+          const googleAddress = await googleReverseGeocode(longitude, latitude);
+          console.log("Google devolvió dirección para ubicación actual:", googleAddress);
+          
+          // Extract place name
+          const locationName = googleAddress.split(',')[0] || "Lugar del evento";
+          
+          // Store location data
+          const locationData = {
+            latitude: parseFloat(String(latitude)),
+            longitude: parseFloat(String(longitude)),
+            locationAddress: googleAddress,
+            locationName: locationName
+          };
+          
+          console.log("Guardando datos de ubicación actual (Google):", locationData);
+          setTempLocationData(locationData);
+          
+          toast({
+            title: "Ubicación seleccionada",
+            description: googleAddress,
+          });
+        } catch (googleError) {
+          console.error("Error obteniendo dirección de Google para ubicación actual:", googleError);
+          
+          // Fallback a Mapbox si Google falla
+          try {
+            console.log("Intentando obtener dirección con Mapbox");
+            const mapboxAddress = await reverseGeocode(longitude, latitude);
+            
+            // Extract place name
+            const locationName = mapboxAddress.split(',')[0] || "Lugar del evento";
+            
+            // Store location data
+            const fallbackData = {
+              latitude: parseFloat(String(latitude)),
+              longitude: parseFloat(String(longitude)),
+              locationAddress: mapboxAddress,
+              locationName: locationName
+            };
+            
+            console.log("Guardando datos de ubicación actual (Mapbox):", fallbackData);
+            setTempLocationData(fallbackData);
+            
+            toast({
+              title: "Ubicación seleccionada",
+              description: mapboxAddress,
+            });
+          } catch (mapboxError) {
+            console.error("También falló Mapbox:", mapboxError);
+            
+            // Último recurso: datos básicos sin dirección
+            const basicData = {
+              latitude: parseFloat(String(latitude)),
+              longitude: parseFloat(String(longitude)),
+              locationAddress: "Dirección desconocida",
+              locationName: "Lugar del evento"
+            };
+            
+            console.log("Guardando datos de ubicación básicos:", basicData);
+            setTempLocationData(basicData);
+            
+            toast({
+              title: "Ubicación seleccionada",
+              description: "No se pudo obtener la dirección. La ubicación ha sido seleccionada, pero sin dirección.",
+              variant: "destructive",
+            });
+          }
+        }
+      } else {
+        // Just add a marker for current location if not in selection mode
+        new mapboxgl.Marker({ color: '#1DA1F2' })
+          .setLngLat([longitude, latitude])
+          .addTo(mapRef.current);
+        
+        toast({
+          title: "Ubicación Actualizada",
+          description: "Mapa centrado en tu ubicación actual",
+        });
+      }
+    } catch (error) {
+      console.error('Error getting location:', error);
+      toast({
+        title: "Error de Ubicación",
+        description: "No se pudo acceder a tu ubicación",
+        variant: "destructive",
+      });
+    }
+  };
+
+  return (
+    <div className="relative flex-1 h-full w-full bg-neutral-100 overflow-hidden">
+      {/* Real Mapbox Map Container */}
+      <div 
+        ref={mapContainerRef}
+        id="map-container" 
+        className="absolute top-0 left-0 right-0 bottom-0 z-0 map-container"
+      ></div>
+      
+      {/* Events Panel - Only visible when eventsPanelVisible is true */}
+      {eventsPanelVisible && (
+        <div className="absolute bottom-20 left-0 right-0 max-h-72 overflow-y-auto z-20 bg-white rounded-t-xl shadow-lg p-4">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-bold">
+              {currentLocation 
+                ? `Eventos cerca de ${currentLocation.locationName || 'esta ubicación'}`
+                : 'Eventos cercanos'
+              }
+            </h2>
+            <button 
+              onClick={() => {
+                setEventsPanelVisible(false);
+                cleanupTempMarkers();
+              }}
+              className="p-1 rounded-full hover:bg-gray-100"
+            >
+              <X size={20} />
+            </button>
+          </div>
+          
+          {isLoading ? (
+            <div className="flex justify-center items-center py-8">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+            </div>
+          ) : locationFilteredEvents.length > 0 ? (
+            <div className="grid grid-cols-1 gap-3 pb-1">
+              {locationFilteredEvents.map((event: Event) => (
+                <Card 
+                  key={event.id} 
+                  className="p-3 shadow-sm cursor-pointer hover:shadow-md transition-shadow flex flex-row gap-3 items-center"
+                  onClick={() => {
+                    // Asegurarse de que latitude y longitude sean números antes de pasar el evento
+                    const formattedEvent = {
+                      ...event,
+                      latitude: typeof event.latitude === 'string' ? parseFloat(event.latitude) : event.latitude,
+                      longitude: typeof event.longitude === 'string' ? parseFloat(event.longitude) : event.longitude
+                    };
+                    
+                    onEventSelect(formattedEvent);
+                    setEventsPanelVisible(false);
+                  }}
+                >
+                  <div className="flex-shrink-0">
+                    <div className="w-12 h-12 rounded-full bg-gray-100 flex items-center justify-center">
+                      <CategoryPin category={event.category} size={24} />
+                    </div>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs font-semibold uppercase text-gray-500 mb-1">
+                      {event.category}
+                    </div>
+                    <h3 className="font-bold text-sm truncate">{event.title}</h3>
+                    <p className="text-xs text-gray-600 truncate">{event.locationName}</p>
+                    <p className="text-xs text-gray-500">
+                      {new Date(event.date).toLocaleDateString('es-ES', { 
+                        month: 'short', 
+                        day: 'numeric', 
+                        hour: '2-digit', 
+                        minute: '2-digit' 
+                      })}
+                    </p>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          ) : currentLocation ? (
+            <div className="w-full text-center py-8 text-gray-500">
+              <p>No hay eventos cerca de {currentLocation.locationName || 'esta ubicación'}</p>
+              <p className="text-sm">Prueba con otra ubicación o crea un evento aquí</p>
+            </div>
+          ) : filteredEvents.length > 0 ? (
+            <div className="grid grid-cols-1 gap-3 pb-1">
+              {filteredEvents.map((event: Event) => (
+                <Card 
+                  key={event.id} 
+                  className="p-3 shadow-sm cursor-pointer hover:shadow-md transition-shadow flex flex-row gap-3 items-center"
+                  onClick={() => {
+                    // Asegurarse de que latitude y longitude sean números antes de pasar el evento
+                    const formattedEvent = {
+                      ...event,
+                      latitude: typeof event.latitude === 'string' ? parseFloat(event.latitude) : event.latitude,
+                      longitude: typeof event.longitude === 'string' ? parseFloat(event.longitude) : event.longitude
+                    };
+                    
+                    onEventSelect(formattedEvent);
+                    setEventsPanelVisible(false);
+                  }}
+                >
+                  <div className="flex-shrink-0">
+                    <div className="w-12 h-12 rounded-full bg-gray-100 flex items-center justify-center">
+                      <CategoryPin category={event.category} size={24} />
+                    </div>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs font-semibold uppercase text-gray-500 mb-1">
+                      {event.category}
+                    </div>
+                    <h3 className="font-bold text-sm truncate">{event.title}</h3>
+                    <p className="text-xs text-gray-600 truncate">{event.locationName}</p>
+                    <p className="text-xs text-gray-500">
+                      {new Date(event.date).toLocaleDateString('es-ES', { 
+                        month: 'short', 
+                        day: 'numeric', 
+                        hour: '2-digit', 
+                        minute: '2-digit' 
+                      })}
+                    </p>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          ) : (
+            <div className="w-full text-center py-8 text-gray-500">
+              <p>No hay eventos que coincidan con tus filtros</p>
+              <p className="text-sm">Intenta con otros filtros o cambia de ubicación</p>
+            </div>
+          )}
+        </div>
+      )}
+      
+      {/* Search Bars */}
+      <div className="absolute top-4 left-4 right-4 z-10 flex flex-col gap-2">
+        {/* Barra de búsqueda principal con filtros */}
+        <div className="flex items-center gap-2">
+          <div className="flex-1">
+            <GooglePlacesSearch 
+              onPlaceSelect={handlePlaceSelect}
+              placeholder="Buscar lugares con Google Maps..."
+            />
+          </div>
+          <Button 
+            variant="outline" 
+            size="icon" 
+            className="h-11 w-11 rounded-full bg-white"
+            onClick={() => setFiltersVisible(!filtersVisible)}
+          >
+            <Filter className="h-5 w-5" />
+          </Button>
+        </div>
+        
+        {/* Barra de búsqueda de MapBox como fallback (temporal) */}
+        {false && (
+          <SearchBar 
+            onSearch={handleSearch} 
+            onFilterClick={() => setFiltersVisible(!filtersVisible)}
+            onPlaceSelect={locationMode ? handlePlaceSelect : undefined}
+          />
+        )}
+      </div>
+      
+      {/* Filters Panel */}
+      {filtersVisible && (
+        <EventFilters 
+          onClose={() => setFiltersVisible(false)} 
+          onApply={(newFilters) => {
+            // Apply the new filters to the parent component
+            if (filters && typeof filters === 'object') {
+              // Update category filter
+              if (newFilters.categories.length > 0) {
+                filters.category = newFilters.categories;
+              } else {
+                delete filters.category;
+              }
+              
+              // Update payment type filter
+              if (newFilters.paymentTypes.length > 0) {
+                filters.paymentType = newFilters.paymentTypes;
+              } else {
+                delete filters.paymentType;
+              }
+              
+              // Update date filter (will need date processing logic)
+              if (newFilters.dateFilter !== "all") {
+                filters.date = newFilters.dateFilter;
+              } else {
+                delete filters.date;
+              }
+            }
+            
+            // Close the filters panel
+            setFiltersVisible(false);
+            toast({
+              title: "Filtros aplicados",
+              description: "Los eventos han sido filtrados según tus preferencias",
+            });
+          }}
+        />
+      )}
+      
+      {/* Location Selection Mode Indicator */}
+      {locationMode && (
+        <div className="absolute top-16 left-0 right-0 z-20 flex justify-center">
+          <div className="bg-primary text-white px-4 py-2 rounded-full shadow-lg">
+            <span className="text-sm font-medium">
+              Selecciona la ubicación para el evento
+            </span>
+          </div>
+        </div>
+      )}
+      
+      {/* Menú contextual cuando se hace clic en el mapa - ESTILO ANTIGUO tipo menú flotante */}
+      {/* Menú contextual - Siempre renderizamos pero usamos visibility para mostrar/ocultar */}
+      <div 
+        className="absolute z-50 bg-white rounded-lg shadow-lg p-2 min-w-[180px] max-w-[300px] context-menu"
+        style={{
+          visibility: contextMenu.visible ? 'visible' : 'hidden',
+          top: contextMenu.y - 100, // Ajustar para que aparezca sobre el marcador
+          left: contextMenu.x,
+          transform: 'translate(-50%, -50%)', // Centrar en el punto del click
+          pointerEvents: contextMenu.visible ? 'auto' : 'none' // Solo recibe eventos cuando es visible
+        }}
+        onClick={(e) => {
+          // Evitar cualquier cierre automático del menú contextual
+          e.stopPropagation();
+          e.preventDefault();
+          console.log("Click en el menú contextual capturado y detenido");
+        }}
+        onMouseDown={(e) => {
+          // También prevenir mousedown para evitar problemas de propagación de eventos
+          e.stopPropagation();
+        }}
+      >
+        <div className="flex flex-col">
+          {/* Título */}
+          <div className="p-2 text-center border-b border-gray-200">
+            <span className="text-sm font-medium">¿Qué quieres hacer?</span>
+          </div>
+          
+          {/* Opciones */}
+          <button 
+            className="p-2 text-left hover:bg-gray-100 text-sm flex items-center gap-2"
+            onClick={handleCreateEventAtLocation}
+          >
+            <Plus size={16} />
+            Crear evento aquí
+          </button>
+          
+          <button 
+            className="p-2 text-left hover:bg-gray-100 text-sm flex items-center gap-2"
+            onClick={() => {
+              closeContextMenu(); // Primero cerramos el menú
+              // Luego buscamos eventos cerca de la ubicación seleccionada
+              if (contextMenu.lngLat) {
+                handleSearchNearbyEvents(contextMenu.lngLat);
+              }
+            }}
+          >
+            <Compass size={16} />
+            Buscar eventos cerca
+          </button>
+          
+          <button 
+            className="p-2 text-left hover:bg-gray-100 text-sm flex items-center gap-2"
+            onClick={closeContextMenu}
+          >
+            <X size={16} />
+            Cancelar
+          </button>
+        </div>
+      )}
+      
+      {/* Solo mostramos el encabezado de selección sin la tarjeta de información */}
+      
+      {/* Current Location Button - Always visible */}
+      <button 
+        className="absolute bottom-16 right-4 p-3 bg-white rounded-full shadow-lg text-neutral-700 border border-neutral-200 hover:bg-gray-50 flex items-center justify-center z-20"
+        onClick={handleGoToCurrentLocation}
+        title="Ir a mi ubicación"
+        aria-label="Ir a mi ubicación actual"
+      >
+        <Circle size={24} />
+      </button>
+      
+      {/* Main action buttons - Centered at bottom - SIEMPRE VISIBLES */}
+      <div className="absolute bottom-6 left-0 right-0 z-20 flex justify-center gap-4 px-6">
+        {showActionsForLocation ? (
+          // Botones específicos para la ubicación buscada
+          <>
+            {/* Buscar Eventos Cercanos */}
+            <button 
+              className="flex-1 py-3 bg-white rounded-xl shadow-lg text-neutral-700 border border-neutral-200 flex items-center justify-center gap-2 font-medium"
+              onClick={handleSearchEventsAtLocation}
+            >
+              <Compass size={20} />
+              Buscar eventos aquí
+            </button>
+            
+            {/* Crear Evento Aquí */}
+            <button 
+              className="flex-1 py-3 bg-primary rounded-xl shadow-lg text-white flex items-center justify-center gap-2 font-medium"
+              onClick={handleCreateEventAtCurrentLocation}
+            >
+              <Plus size={20} />
+              Crear un evento aquí
+            </button>
+          </>
+        ) : !locationMode ? (
+          // Botones normales - Modo estándar
+          <>
+            {/* Discover Events Button */}
+            <button 
+              className="flex-1 py-3 bg-white rounded-xl shadow-lg text-neutral-700 border border-neutral-200 flex items-center justify-center gap-2 font-medium"
+              onClick={() => setEventsPanelVisible(!eventsPanelVisible)}
+            >
+              <Compass size={20} />
+              Descubrir eventos
+            </button>
+            
+            {/* Create Event Button */}
+            <button 
+              className="flex-1 py-3 bg-primary rounded-xl shadow-lg text-white flex items-center justify-center gap-2 font-medium"
+              onClick={toggleLocationMode}
+            >
+              <Plus size={20} />
+              Crear un evento
+            </button>
+          </>
+        ) : (
+          // Botones para modo de selección de ubicación
+          <>
+            {/* Cancel Location Selection */}
+            <button 
+              className="flex-1 py-3 bg-white rounded-xl shadow-lg text-red-600 border border-neutral-200 flex items-center justify-center gap-2 font-medium"
+              onClick={() => {
+                setLocationMode(false);
+                resetLocationSelection();
+              }}
+            >
+              <X size={20} />
+              Cancelar
+            </button>
+            
+            {/* Confirm Location Button */}
+            <button 
+              className="flex-1 py-3 bg-primary rounded-xl shadow-lg text-white flex items-center justify-center gap-2 font-medium"
+              onClick={confirmLocationSelection}
+              disabled={!tempLocationData}
+            >
+              <Check size={20} />
+              Crear un evento aquí
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default MapView;

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Direct Auth Test</title>
+</head>
+<body>
+    <h1>Direct Authentication Test</h1>
+    <button onclick="testLogin()">Test Login</button>
+    <button onclick="testLocalStorage()">Test LocalStorage</button>
+    <button onclick="testStoredToken()">Test Stored Token</button>
+    <div id="result"></div>
+
+    <script>
+        function log(message) {
+            document.getElementById('result').innerHTML += message + '<br>';
+            console.log(message);
+        }
+
+        function testLocalStorage() {
+            try {
+                localStorage.setItem('test_key', 'test_value');
+                const retrieved = localStorage.getItem('test_key');
+                localStorage.removeItem('test_key');
+                log(`LocalStorage test: ${retrieved === 'test_value' ? 'PASSED' : 'FAILED'}`);
+            } catch (error) {
+                log(`LocalStorage test failed: ${error}`);
+            }
+        }
+
+        async function testLogin() {
+            log('Testing login...');
+            try {
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        email: 'facundoroman203@gmail.com',
+                        password: '123456'
+                    }),
+                });
+
+                const data = await response.json();
+                
+                if (response.ok && data.token) {
+                    log(`Login successful! Token: ${data.token.substring(0, 20)}...`);
+                    
+                    // Store token
+                    localStorage.setItem('pipol_auth_token', data.token);
+                    localStorage.setItem('pipol_user_data', JSON.stringify(data.user));
+                    
+                    log('Token stored in localStorage');
+                    
+                    // Verify storage
+                    const storedToken = localStorage.getItem('pipol_auth_token');
+                    log(`Token verification: ${storedToken ? 'Found' : 'Not found'}`);
+                    
+                } else {
+                    log(`Login failed: ${data.message}`);
+                }
+            } catch (error) {
+                log(`Error: ${error}`);
+            }
+        }
+
+        async function testStoredToken() {
+            const token = localStorage.getItem('pipol_auth_token');
+            if (!token) {
+                log('No token found in storage');
+                return;
+            }
+
+            log(`Testing stored token: ${token.substring(0, 20)}...`);
+            
+            try {
+                const response = await fetch('/api/auth/me', {
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                if (response.ok) {
+                    const userData = await response.json();
+                    log(`Token works! User: ${userData.name}`);
+                } else {
+                    log(`Token invalid: ${response.status}`);
+                }
+            } catch (error) {
+                log(`Error testing token: ${error}`);
+            }
+        }
+    </script>
+</body>
+</html>
