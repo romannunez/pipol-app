@@ -3219,9 +3219,41 @@ const MapView = ({
                                       : event.longitude,
                                 };
 
-                                // Activate focused mode when event is selected
+                                // Aplicar la misma secuencia completa del focused mode que cuando se hace clic en un marker
+                                const lng = formattedEvent.longitude;
+                                const lat = formattedEvent.latitude;
+
+                                // Verificar que las coordenadas sean válidas antes de proceder
+                                if (!isNaN(lng) && !isNaN(lat)) {
+                                  // 1. Guardar estado de la cámara antes de hacer flyTo
+                                  console.log("🚨 DEBUG: Guardando estado de cámara antes de ir al evento desde panel");
+                                  saveCameraState();
+
+                                  // 2. Hacer flyTo hacia el evento con la misma configuración que los markers
+                                  if (mapRef.current) {
+                                    // Calcular offset para posicionar el marker en área visible sobre el panel
+                                    const screenHeight = mapRef.current.getContainer().clientHeight;
+                                    const offsetPixels = screenHeight * 0.35; // Offset conservativo del 35% hacia arriba
+
+                                    mapRef.current.flyTo({
+                                      center: [lng, lat],
+                                      zoom: 18, // Zoom más cercano para efecto focal
+                                      duration: 1200, // Animación más larga y suave
+                                      essential: true,
+                                      pitch: is3DMode ? 60 : 0, // Mantener vista 3D si está activada, sino usar 0 para 2D
+                                      bearing: mapRef.current.getBearing(), // Mantener rotación actual
+                                      offset: [0, -offsetPixels] // Offset negativo (hacia arriba) para mantener marker visible
+                                    });
+                                  }
+                                }
+
+                                // 3. Activar focused mode
                                 setIsFocusedMode(true);
+                                
+                                // 4. Seleccionar el evento (esto abrirá el panel de detalles)
                                 onEventSelect(formattedEvent);
+                                
+                                // 5. Cerrar el panel de descubrir eventos
                                 setEventsPanelVisible(false);
                               }}
                             >
